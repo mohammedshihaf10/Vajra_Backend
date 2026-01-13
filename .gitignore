@@ -1,0 +1,26 @@
+# Go
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Go modules
+/vendor/
+
+# Environment files
+.env
+
+# Swagger generated files (optional)
+docs/swagger.json
+docs/swagger.yaml
+
+# OS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+
+# Logs
+*.log
