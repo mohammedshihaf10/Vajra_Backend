@@ -1,13 +1,16 @@
 package routes
 
 import (
+	"os"
+
 	"github.com/gin-gonic/gin"
 	"github.com/jmoiron/sqlx"
 
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
 
-	"vijraBackend/internal/handlers"
+	"vajraBackend/internal/handlers"
+	"vajraBackend/internal/middleware"
 )
 
 func RegisterRoutes(r *gin.Engine, db *sqlx.DB) {
@@ -19,11 +22,30 @@ func RegisterRoutes(r *gin.Engine, db *sqlx.DB) {
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{"status": "ok"})
 	})
+
 	userHandler := handlers.NewUserHandler(db)
+	authHandler := handlers.NewAuthHandler(db)
 
 	users := r.Group("/users")
 	{
 		users.POST("/create", userHandler.CreateUser)
+		users.GET("/email/:email", userHandler.GetUserByEmail)
 		users.GET("/:id", userHandler.GetUser)
+	}
+
+	auth := r.Group("/auth")
+	{
+		auth.POST("/register", authHandler.Register)
+		auth.POST("/login", authHandler.Login)
+		auth.POST("/logout", authHandler.Logout)
+		auth.POST("/refresh", authHandler.Refresh)
+		auth.POST("/send-otp", authHandler.SendOTP)
+	}
+
+	secret := []byte(os.Getenv("JWT_SECRET"))
+	protected := r.Group("/")
+	protected.Use(middleware.RequireAuth(secret))
+	{
+		protected.GET("/me", authHandler.Me)
 	}
 }

@@ -2,13 +2,12 @@ package handlers
 
 import (
 	"net/http"
-	"strconv"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jmoiron/sqlx"
 
-	"vijraBackend/internal/models"
-	"vijraBackend/internal/repositories"
+	"vajraBackend/internal/models"
+	"vajraBackend/internal/repositories"
 )
 
 type UserHandler struct {
@@ -23,13 +22,14 @@ func NewUserHandler(db *sqlx.DB) *UserHandler {
 
 // CreateUser godoc
 // @Summary Create a new user
-// @Description Create a user with name and email
+// @Description Create a user with full name, email, and phone number
 // @Tags users
 // @Accept json
 // @Produce json
 // @Param user body models.User true "User payload"
 // @Success 201 {object} models.User
 // @Failure 400 {object} map[string]string
+// @Failure 500 {object} map[string]string
 // @Router /users/create [post]
 func (h *UserHandler) CreateUser(c *gin.Context) {
 	var user models.User
@@ -37,6 +37,13 @@ func (h *UserHandler) CreateUser(c *gin.Context) {
 	if err := c.ShouldBindJSON(&user); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": err.Error(),
+		})
+		return
+	}
+
+	if user.PhoneNumber == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "phone_number is required",
 		})
 		return
 	}
@@ -60,8 +67,7 @@ func (h *UserHandler) CreateUser(c *gin.Context) {
 // @Success 200 {object} models.User
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
-// @Router /users/{email} [get]
-// GET /users/:email
+// @Router /users/email/{email} [get]
 func (h *UserHandler) GetUserByEmail(c *gin.Context) {
 	email := c.Param("email")
 
@@ -85,25 +91,16 @@ func (h *UserHandler) GetUserByEmail(c *gin.Context) {
 
 // GetUser godoc
 // @Summary Get a user by ID
-// @Description Fetch a user using their numeric ID
+// @Description Fetch a user using their UUID
 // @Tags users
 // @Produce json
-// @Param id path int true "User ID"
+// @Param id path string true "User ID"
 // @Success 200 {object} models.User
-// @Failure 400 {object} map[string]string
 // @Failure 404 {object} map[string]string
 // @Failure 500 {object} map[string]string
 // @Router /users/{id} [get]
-// GET /users/:id
 func (h *UserHandler) GetUser(c *gin.Context) {
-	idParam := c.Param("id")
-	id, err := strconv.Atoi(idParam)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "invalid user id",
-		})
-		return
-	}
+	id := c.Param("id")
 
 	user, err := h.repo.GetByID(id)
 	if err != nil {
@@ -121,4 +118,8 @@ func (h *UserHandler) GetUser(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, user)
+}
+
+func (h *UserHandler) GetUserByID(id string) (*models.User, error) {
+	return h.repo.GetByID(id)
 }

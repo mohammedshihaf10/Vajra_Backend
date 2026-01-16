@@ -1,4 +1,4 @@
-module vijraBackend
+module vajraBackend
 
 go 1.25.5
 

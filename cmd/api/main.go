@@ -5,10 +5,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"vijraBackend/internal/config"
-	"vijraBackend/internal/db"
-	"vijraBackend/internal/routes"
-	_"vijraBackend/docs"
+	_ "vajraBackend/docs"
+	"vajraBackend/internal/config"
+	"vajraBackend/internal/db"
+	"vajraBackend/internal/routes"
 )
 
 // @title Vijra Backend API
