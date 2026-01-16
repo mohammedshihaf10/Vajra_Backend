@@ -136,6 +136,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	}
 
 	valid, err := h.repo.VerifyPhoneOTP(req.PhoneNumber, req.OTP)
+	log.Println("OTP verification result:", valid, "error:", err) // Debug log
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify otp"})
 		return
@@ -146,6 +147,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	}
 
 	user, err := h.repo.GetByPhoneNumber(req.PhoneNumber)
+	log.Println("Fetched user:", user, "error:", err) // Debug log
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch user"})
 		return

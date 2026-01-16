@@ -2,6 +2,7 @@ package repositories
 
 import (
 	"database/sql"
+	"log"
 	"time"
 
 	"vajraBackend/internal/models"
@@ -62,7 +63,7 @@ func (r *UserRepository) Create(user *models.User) error {
 
 func (r *UserRepository) GetByEmail(email string) (*models.User, error) {
 	user := models.User{}
-	query := `SELECT * FROM users WHERE email = $1`
+	query := `SELECT id, full_name, COALESCE(email, ''), phone_number, auth_provider, is_email_verified, is_phone_verified, status, timezone, auth_token, auth_token_expires_at, created_at, updated_at FROM users WHERE email = $1`
 
 	err := r.db.Get(&user, query, email)
 	if err == sql.ErrNoRows {
@@ -73,9 +74,26 @@ func (r *UserRepository) GetByEmail(email string) (*models.User, error) {
 
 func (r *UserRepository) GetByPhoneNumber(phoneNumber string) (*models.User, error) {
 	user := models.User{}
-	query := `SELECT * FROM users WHERE phone_number = $1`
-
+	query := `
+	SELECT
+		id,
+		full_name,
+		COALESCE(email, '') AS email,
+		phone_number,
+		auth_provider,
+		is_email_verified,
+		is_phone_verified,
+		status,
+		timezone,
+		auth_token,
+		auth_token_expires_at,
+		created_at,
+		updated_at
+	FROM users
+	WHERE phone_number = $1
+	`
 	err := r.db.Get(&user, query, phoneNumber)
+	log.Println("GetByPhoneNumber query executed with phone number:", phoneNumber, "error:", err)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -84,7 +102,7 @@ func (r *UserRepository) GetByPhoneNumber(phoneNumber string) (*models.User, err
 
 func (r *UserRepository) GetByID(id string) (*models.User, error) {
 	user := models.User{}
-	query := `SELECT * FROM users WHERE id = $1`
+	query := `SELECT id, full_name, COALESCE(email, ''), phone_number, auth_provider, is_email_verified, is_phone_verified, status, timezone, auth_token, auth_token_expires_at, created_at, updated_at FROM users WHERE id = $1`
 
 	err := r.db.Get(&user, query, id)
 	if err == sql.ErrNoRows {
@@ -106,7 +124,8 @@ func (r *UserRepository) SetAuthToken(userID, token string, expiresAt time.Time)
 func (r *UserRepository) GetByAuthToken(token string) (*models.User, error) {
 	user := models.User{}
 	query := `
-		SELECT * FROM users
+		SELECT id, full_name, COALESCE(email, ''), phone_number, auth_provider, is_email_verified, is_phone_verified, status, timezone, auth_token, auth_token_expires_at, created_at, updated_at
+		FROM users
 		WHERE auth_token = $1 AND auth_token_expires_at > NOW()
 	`
 
@@ -182,4 +201,3 @@ func (r *UserRepository) MarkPhoneVerified(userID string) error {
 	_, err := r.db.Exec(query, userID)
 	return err
 }
-

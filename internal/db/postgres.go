@@ -10,6 +10,7 @@ import (
 
 func Connect() *sqlx.DB {
 	dsn := os.Getenv("DB_DSN")
+	log.Println("Connecting to database:", dsn)
 
 	db, err := sqlx.Connect("postgres", dsn)
 	if err != nil {
