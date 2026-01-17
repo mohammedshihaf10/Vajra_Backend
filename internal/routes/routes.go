@@ -25,6 +25,7 @@ func RegisterRoutes(r *gin.Engine, db *sqlx.DB) {
 
 	userHandler := handlers.NewUserHandler(db)
 	authHandler := handlers.NewAuthHandler(db)
+	walletHandler := handlers.NewWalletHandler(db)
 
 	users := r.Group("/users")
 	{
@@ -47,5 +48,13 @@ func RegisterRoutes(r *gin.Engine, db *sqlx.DB) {
 	protected.Use(middleware.RequireAuth(secret))
 	{
 		protected.GET("/me", authHandler.Me)
+		protected.POST("/wallet/topup/initiate", walletHandler.InitiateTopup)
+		protected.GET("/wallet/balance", walletHandler.GetBalance)
+		protected.GET("/wallet/transactions", walletHandler.GetTransactions)
+	}
+
+	webhooks := r.Group("/webhooks")
+	{
+		webhooks.POST("/payment", walletHandler.PaymentWebhook)
 	}
 }

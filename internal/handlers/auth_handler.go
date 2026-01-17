@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	accessTTL  = 15 * time.Minute
+	accessTTL  = 24 * time.Hour
 	refreshTTL = 30 * 24 * time.Hour
 )
 
@@ -319,12 +319,14 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 // @Router /me [get]
 func (h *AuthHandler) Me(c *gin.Context) {
 	userID := c.GetString("user_id")
+	log.Println("Me endpoint accessed by user_id:", userID) // Debug log
 	if userID == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 		return
 	}
 
 	user, err := h.repo.GetByID(userID)
+	log.Println("Fetched user in Me endpoint:", user, "error:", err) // Debug log
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch user"})
 		return
