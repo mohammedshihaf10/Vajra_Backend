@@ -11,6 +11,7 @@ import (
 
 	"vajraBackend/internal/handlers"
 	"vajraBackend/internal/middleware"
+	"vajraBackend/internal/ocpp"
 )
 
 func RegisterRoutes(r *gin.Engine, db *sqlx.DB) {
@@ -26,6 +27,20 @@ func RegisterRoutes(r *gin.Engine, db *sqlx.DB) {
 	userHandler := handlers.NewUserHandler(db)
 	authHandler := handlers.NewAuthHandler(db)
 	walletHandler := handlers.NewWalletHandler(db)
+	ocppServer := ocpp.NewServer()
+	ocppServer.AttachDB(db.DB)
+	chargingHandler := handlers.NewChargingHandler(db, ocppServer)
+
+	r.GET("/ocpp", func(c *gin.Context) {
+		ocppServer.HandleWS(c.Writer, c.Request)
+	})
+
+	r.GET("/ocpp/:id", func(c *gin.Context) {
+		q := c.Request.URL.Query()
+		q.Set("id", c.Param("id"))
+		c.Request.URL.RawQuery = q.Encode()
+		ocppServer.HandleWS(c.Writer, c.Request)
+	})
 
 	users := r.Group("/users")
 	{
@@ -51,6 +66,13 @@ func RegisterRoutes(r *gin.Engine, db *sqlx.DB) {
 		protected.POST("/wallet/topup/initiate", walletHandler.InitiateTopup)
 		protected.GET("/wallet/balance", walletHandler.GetBalance)
 		protected.GET("/wallet/transactions", walletHandler.GetTransactions)
+		protected.POST("/chargers/verify", chargingHandler.VerifyCharger)
+		protected.POST("/charging/start", chargingHandler.StartCharging)
+		protected.POST("/charging/stop", chargingHandler.StopCharging)
+		protected.GET("/charging/session/:id", chargingHandler.GetSession)
+		protected.GET("/charging/active", chargingHandler.GetActiveSession)
+		protected.GET("/charging/sessions", chargingHandler.ListSessions)
+		protected.GET("/ws/charging/:session_id", chargingHandler.LiveUpdatesWS)
 	}
 
 	webhooks := r.Group("/webhooks")

@@ -164,3 +164,71 @@ func (r *WalletRepository) ProcessTopupWebhook(orderID, paymentID, status, curre
 
 	return true, tx.Commit()
 }
+
+func (r *WalletRepository) DebitWalletForSession(userID string, amount float64, sessionID string) error {
+	if amount <= 0 {
+		return nil
+	}
+
+	tx, err := r.db.Beginx()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	wallet := models.Wallet{}
+	walletQuery := `
+		SELECT id, user_id, balance, currency, status, locked_amount, created_at, updated_at
+		FROM wallets
+		WHERE user_id = $1
+		FOR UPDATE
+	`
+	if err := tx.Get(&wallet, walletQuery, userID); err != nil {
+		return err
+	}
+
+	if wallet.Status != "active" {
+		return errors.New("wallet is not active")
+	}
+
+	if wallet.Balance < amount {
+		return errors.New("insufficient balance")
+	}
+
+	insertQuery := `
+		INSERT INTO wallet_transactions (
+			wallet_id, transaction_type, amount, currency, source, reference_id, idempotency_key, status, description
+		)
+		VALUES ($1, 'DEBIT', $2, $3, 'charging', $4, $4, 'success', 'Charging cost')
+		ON CONFLICT (idempotency_key) DO NOTHING
+	`
+	result, err := tx.Exec(insertQuery, wallet.ID, amount, wallet.Currency, sessionID)
+	if err != nil {
+		return err
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+
+	if affected > 0 {
+		updateWallet := `
+			UPDATE wallets
+			SET balance = balance - $1, updated_at = NOW()
+			WHERE id = $2
+		`
+		if _, err := tx.Exec(updateWallet, amount, wallet.ID); err != nil {
+			return err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
