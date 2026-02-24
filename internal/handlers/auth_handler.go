@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	accessTTL  = 24 * time.Hour
+	accessTTL  = 14 * 24 * time.Hour
 	refreshTTL = 30 * 24 * time.Hour
 )
 
