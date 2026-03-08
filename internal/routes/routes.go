@@ -1,7 +1,9 @@
 package routes
 
 import (
+	"log"
 	"os"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jmoiron/sqlx"
@@ -9,9 +11,9 @@ import (
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
 
+	"vajraBackend/internal/charging"
 	"vajraBackend/internal/handlers"
 	"vajraBackend/internal/middleware"
-	"vajraBackend/internal/ocpp"
 )
 
 func RegisterRoutes(r *gin.Engine, db *sqlx.DB) {
@@ -27,20 +29,12 @@ func RegisterRoutes(r *gin.Engine, db *sqlx.DB) {
 	userHandler := handlers.NewUserHandler(db)
 	authHandler := handlers.NewAuthHandler(db)
 	walletHandler := handlers.NewWalletHandler(db)
-	ocppServer := ocpp.NewServer()
-	ocppServer.AttachDB(db.DB)
-	chargingHandler := handlers.NewChargingHandler(db, ocppServer)
-
-	r.GET("/ocpp", func(c *gin.Context) {
-		ocppServer.HandleWS(c.Writer, c.Request)
-	})
-
-	r.GET("/ocpp/:id", func(c *gin.Context) {
-		q := c.Request.URL.Query()
-		q.Set("id", c.Param("id"))
-		c.Request.URL.RawQuery = q.Encode()
-		ocppServer.HandleWS(c.Writer, c.Request)
-	})
+	ocppBaseURL := strings.TrimSpace(os.Getenv("OCPP_SERVICE_BASE_URL"))
+	if ocppBaseURL == "" {
+		log.Fatal("missing OCPP_SERVICE_BASE_URL")
+	}
+	gatewayClient := charging.NewHTTPGatewayClient(ocppBaseURL, os.Getenv("OCPP_SERVICE_API_KEY"))
+	chargingHandler := handlers.NewChargingHandler(db, gatewayClient)
 
 	users := r.Group("/users")
 	{
@@ -78,5 +72,6 @@ func RegisterRoutes(r *gin.Engine, db *sqlx.DB) {
 	webhooks := r.Group("/webhooks")
 	{
 		webhooks.POST("/payment", walletHandler.PaymentWebhook)
+		webhooks.POST("/ocpp", chargingHandler.OCPPWebhook)
 	}
 }

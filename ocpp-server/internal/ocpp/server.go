@@ -2,13 +2,13 @@ package ocpp
 
 import (
 	"crypto/rand"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,8 +20,6 @@ type ChargerConnection struct {
 	Conn              *websocket.Conn
 	StatusByConnector map[int]string
 	LastSeen          time.Time
-	Vendor            string
-	Model             string
 }
 
 type Registry struct {
@@ -79,18 +77,6 @@ func (r *Registry) GetStatus(id string, connectorID int) (string, bool) {
 	return status, ok
 }
 
-func (r *Registry) UpdateBootInfo(id, vendor, model string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	charger, ok := r.chargers[id]
-	if !ok {
-		return
-	}
-	charger.Vendor = vendor
-	charger.Model = model
-	charger.LastSeen = time.Now().UTC()
-}
-
 func (r *Registry) GetConnection(id string) (*websocket.Conn, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -99,14 +85,6 @@ func (r *Registry) GetConnection(id string) (*websocket.Conn, bool) {
 		return nil, false
 	}
 	return charger.Conn, true
-}
-
-type Callbacks struct {
-	OnRemoteStartResult func(sessionID string, accepted bool)
-	OnRemoteStopResult  func(sessionID string, accepted bool)
-	OnStartTransaction  func(cpID string, connectorID int, transactionID int, meterStartKwh float64)
-	OnMeterValues       func(cpID string, connectorID int, transactionID int, energyKwh float64)
-	OnStopTransaction   func(cpID string, transactionID int, meterStopKwh float64)
 }
 
 type pendingCall struct {
@@ -121,41 +99,140 @@ type Server struct {
 	pendingMu sync.Mutex
 	pending   map[string]pendingCall
 
-	callbacks Callbacks
-
 	seqMu          sync.Mutex
 	transactionSeq int
 
 	meterMu     sync.Mutex
 	meterStarts map[int]float64
 
-	db *sql.DB
+	webhooks *WebhookClient
 }
 
-func NewServer() *Server {
+func NewServer(webhookURL string, webhookSecret string, timeoutSec int) *Server {
 	return &Server{
 		Registry: NewRegistry(),
 		Upgrader: websocket.Upgrader{
 			Subprotocols: []string{"ocpp1.6", "ocpp1.6j", "ocpp1.6-json"},
-			CheckOrigin: func(r *http.Request) bool { return true },
+			CheckOrigin:  func(r *http.Request) bool { return true },
 		},
 		pending:     make(map[string]pendingCall),
 		meterStarts: make(map[int]float64),
+		webhooks:    NewWebhookClient(webhookURL, webhookSecret, timeoutSec),
 	}
 }
 
-func (s *Server) AttachDB(db *sql.DB) {
-	s.db = db
+type remoteStartRequest struct {
+	SessionID   string `json:"session_id"`
+	ChargerID   string `json:"charger_id"`
+	ConnectorID int    `json:"connector_id"`
+	IDTag       string `json:"id_tag"`
 }
 
-func (s *Server) SetCallbacks(callbacks Callbacks) {
-	s.callbacks = callbacks
+type remoteStopRequest struct {
+	SessionID     string `json:"session_id"`
+	ChargerID     string `json:"charger_id"`
+	TransactionID int    `json:"transaction_id"`
 }
 
-func (s *Server) RegisterPending(messageID, action, sessionID string) {
+func (s *Server) HandleChargerReadAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	path := strings.TrimPrefix(r.URL.Path, "/v1/chargers/")
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) < 2 {
+		http.NotFound(w, r)
+		return
+	}
+
+	chargerID := parts[0]
+	if chargerID == "" {
+		http.Error(w, "missing charger id", http.StatusBadRequest)
+		return
+	}
+
+	if len(parts) == 2 && parts[1] == "connectivity" {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"connected": s.Registry.IsConnected(chargerID),
+		})
+		return
+	}
+
+	if len(parts) == 4 && parts[1] == "connectors" && parts[3] == "status" {
+		connectorID, err := strconv.Atoi(parts[2])
+		if err != nil || connectorID <= 0 {
+			http.Error(w, "invalid connector id", http.StatusBadRequest)
+			return
+		}
+		status, ok := s.Registry.GetStatus(chargerID, connectorID)
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"status": status,
+			"known":  ok,
+		})
+		return
+	}
+
+	http.NotFound(w, r)
+}
+
+func (s *Server) HandleRemoteStart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req remoteStartRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid payload", http.StatusBadRequest)
+		return
+	}
+	if req.SessionID == "" || req.ChargerID == "" || req.ConnectorID <= 0 || req.IDTag == "" {
+		http.Error(w, "session_id, charger_id, connector_id, id_tag are required", http.StatusBadRequest)
+		return
+	}
+
+	messageID, err := s.SendRemoteStartTransaction(req.ChargerID, req.ConnectorID, req.IDTag)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	s.pendingMu.Lock()
-	defer s.pendingMu.Unlock()
-	s.pending[messageID] = pendingCall{Action: action, SessionID: sessionID}
+	s.pending[messageID] = pendingCall{Action: "RemoteStartTransaction", SessionID: req.SessionID}
+	s.pendingMu.Unlock()
+
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted"})
+}
+
+func (s *Server) HandleRemoteStop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req remoteStopRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid payload", http.StatusBadRequest)
+		return
+	}
+	if req.SessionID == "" || req.ChargerID == "" || req.TransactionID <= 0 {
+		http.Error(w, "session_id, charger_id, transaction_id are required", http.StatusBadRequest)
+		return
+	}
+
+	messageID, err := s.SendRemoteStopTransaction(req.ChargerID, req.TransactionID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	s.pendingMu.Lock()
+	s.pending[messageID] = pendingCall{Action: "RemoteStopTransaction", SessionID: req.SessionID}
+	s.pendingMu.Unlock()
+
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted"})
 }
 
 func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
@@ -173,7 +250,6 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 
 	log.Println("ocpp: charger connected:", cpID, "subprotocol:", conn.Subprotocol())
 	s.Registry.Add(cpID, conn)
-
 	go s.handleConnection(cpID, conn)
 }
 
@@ -200,11 +276,6 @@ type statusNotificationPayload struct {
 	ConnectorID int    `json:"connectorId"`
 	Status      string `json:"status"`
 	ErrorCode   string `json:"errorCode"`
-}
-
-type bootNotificationPayload struct {
-	ChargePointVendor string `json:"chargePointVendor"`
-	ChargePointModel  string `json:"chargePointModel"`
 }
 
 type startTransactionPayload struct {
@@ -271,7 +342,7 @@ func (s *Server) handleCall(cpID string, conn *websocket.Conn, parts []json.RawM
 
 	switch action {
 	case "BootNotification":
-		s.handleBootNotification(cpID, conn, messageID, parts)
+		s.sendBootNotificationResponse(conn, messageID)
 	case "Heartbeat":
 		s.sendHeartbeatResponse(conn, messageID)
 	case "StatusNotification":
@@ -283,7 +354,7 @@ func (s *Server) handleCall(cpID string, conn *websocket.Conn, parts []json.RawM
 	case "MeterValues":
 		s.handleMeterValues(cpID, conn, messageID, parts)
 	default:
-		s.sendNotSupported(conn, messageID, action)
+		s.sendNotSupported(conn, messageID)
 	}
 }
 
@@ -311,31 +382,21 @@ func (s *Server) handleCallResult(parts []json.RawMessage) {
 	if err := json.Unmarshal(parts[2], &payload); err != nil {
 		return
 	}
-
 	status, _ := payload["status"].(string)
 	accepted := status == "Accepted"
 
 	switch pending.Action {
 	case "RemoteStartTransaction":
-		if s.callbacks.OnRemoteStartResult != nil {
-			s.callbacks.OnRemoteStartResult(pending.SessionID, accepted)
-		}
+		s.webhooks.Emit("remote_start_result", map[string]interface{}{
+			"session_id": pending.SessionID,
+			"accepted":   accepted,
+		})
 	case "RemoteStopTransaction":
-		if s.callbacks.OnRemoteStopResult != nil {
-			s.callbacks.OnRemoteStopResult(pending.SessionID, accepted)
-		}
+		s.webhooks.Emit("remote_stop_result", map[string]interface{}{
+			"session_id": pending.SessionID,
+			"accepted":   accepted,
+		})
 	}
-}
-
-func (s *Server) handleBootNotification(cpID string, conn *websocket.Conn, messageID string, parts []json.RawMessage) {
-	if len(parts) >= 4 {
-		var payload bootNotificationPayload
-		if err := json.Unmarshal(parts[3], &payload); err == nil {
-			s.Registry.UpdateBootInfo(cpID, payload.ChargePointVendor, payload.ChargePointModel)
-		}
-	}
-
-	s.sendBootNotificationResponse(conn, messageID)
 }
 
 func (s *Server) handleStatusNotification(cpID string, conn *websocket.Conn, messageID string, parts []json.RawMessage) {
@@ -351,8 +412,6 @@ func (s *Server) handleStatusNotification(cpID string, conn *websocket.Conn, mes
 	}
 
 	s.Registry.UpdateStatus(cpID, payload.ConnectorID, payload.Status)
-	s.upsertCharger(cpID, payload.Status)
-	
 	s.sendEmptyResponse(conn, messageID)
 }
 
@@ -385,14 +444,16 @@ func (s *Server) handleStartTransaction(cpID string, conn *websocket.Conn, messa
 			},
 		},
 	}
-
 	if err := conn.WriteJSON(response); err != nil {
 		log.Println("ocpp: write start transaction response error:", err)
 	}
 
-	if s.callbacks.OnStartTransaction != nil {
-		s.callbacks.OnStartTransaction(cpID, payload.ConnectorID, txID, meterStartKwh)
-	}
+	s.webhooks.Emit("start_transaction", map[string]interface{}{
+		"charge_point_id": cpID,
+		"connector_id":    payload.ConnectorID,
+		"transaction_id":  txID,
+		"meter_start_kwh": meterStartKwh,
+	})
 }
 
 func (s *Server) handleStopTransaction(cpID string, conn *websocket.Conn, messageID string, parts []json.RawMessage) {
@@ -422,14 +483,15 @@ func (s *Server) handleStopTransaction(cpID string, conn *websocket.Conn, messag
 			},
 		},
 	}
-
 	if err := conn.WriteJSON(response); err != nil {
 		log.Println("ocpp: write stop transaction response error:", err)
 	}
 
-	if s.callbacks.OnStopTransaction != nil {
-		s.callbacks.OnStopTransaction(cpID, payload.TransactionID, meterStopKwh)
-	}
+	s.webhooks.Emit("stop_transaction", map[string]interface{}{
+		"charge_point_id": cpID,
+		"transaction_id":  payload.TransactionID,
+		"meter_stop_kwh":  meterStopKwh,
+	})
 }
 
 func (s *Server) handleMeterValues(cpID string, conn *websocket.Conn, messageID string, parts []json.RawMessage) {
@@ -444,14 +506,16 @@ func (s *Server) handleMeterValues(cpID string, conn *websocket.Conn, messageID 
 		return
 	}
 
-	energyKwh, ok := parseEnergyKwh(payload)
-	if ok {
+	if energyKwh, ok := parseEnergyKwh(payload); ok {
 		if start, okStart := s.getMeterStart(payload.TransactionID); okStart && energyKwh >= start {
 			energyKwh -= start
 		}
-		if s.callbacks.OnMeterValues != nil {
-			s.callbacks.OnMeterValues(cpID, payload.ConnectorID, payload.TransactionID, energyKwh)
-		}
+		s.webhooks.Emit("meter_values", map[string]interface{}{
+			"charge_point_id": cpID,
+			"connector_id":    payload.ConnectorID,
+			"transaction_id":  payload.TransactionID,
+			"energy_kwh":      energyKwh,
+		})
 	}
 
 	s.sendEmptyResponse(conn, messageID)
@@ -467,7 +531,6 @@ func (s *Server) sendBootNotificationResponse(conn *websocket.Conn, messageID st
 			"interval":    30,
 		},
 	}
-
 	if err := conn.WriteJSON(response); err != nil {
 		log.Println("ocpp: write boot response error:", err)
 	}
@@ -481,7 +544,6 @@ func (s *Server) sendHeartbeatResponse(conn *websocket.Conn, messageID string) {
 			"currentTime": time.Now().UTC().Format(time.RFC3339),
 		},
 	}
-
 	if err := conn.WriteJSON(response); err != nil {
 		log.Println("ocpp: write heartbeat response error:", err)
 	}
@@ -501,7 +563,7 @@ func (s *Server) sendCallError(conn *websocket.Conn, messageID, code, descriptio
 	}
 }
 
-func (s *Server) sendNotSupported(conn *websocket.Conn, messageID, action string) {
+func (s *Server) sendNotSupported(conn *websocket.Conn, messageID string) {
 	s.sendCallError(conn, messageID, "NotSupported", "Action not supported")
 }
 
@@ -521,7 +583,6 @@ func (s *Server) SendRemoteStartTransaction(cpID string, connectorID int, idTag 
 			"idTag":       idTag,
 		},
 	}
-
 	if err := conn.WriteJSON(request); err != nil {
 		return "", err
 	}
@@ -543,7 +604,6 @@ func (s *Server) SendRemoteStopTransaction(cpID string, transactionID int) (stri
 			"transactionId": transactionID,
 		},
 	}
-
 	if err := conn.WriteJSON(request); err != nil {
 		return "", err
 	}
@@ -598,15 +658,8 @@ func parseEnergyKwh(payload meterValuesPayload) (float64, bool) {
 	return 0, false
 }
 
-func (s *Server) upsertCharger(id string, status string) {
-	if s.db == nil {
-		return
-	}
-	query := `
-		INSERT INTO chargers (id, status, last_seen)
-		VALUES ($1, $2, NOW())
-		ON CONFLICT (id)
-		DO UPDATE SET status = EXCLUDED.status, last_seen = NOW()
-	`
-	_, _ = s.db.Exec(query, id, status)
+func writeJSON(w http.ResponseWriter, code int, payload interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(payload)
 }

@@ -1,17 +1,24 @@
 package handlers
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"io"
 	"log"
 	"math"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/jmoiron/sqlx"
 
+	"vajraBackend/internal/charging"
 	"vajraBackend/internal/models"
-	"vajraBackend/internal/ocpp"
 	"vajraBackend/internal/repositories"
 )
 
@@ -21,7 +28,7 @@ const (
 )
 
 type ChargingHandler struct {
-	ocppServer   *ocpp.Server
+	gateway      charging.GatewayClient
 	walletRepo   *repositories.WalletRepository
 	chargingRepo *repositories.ChargingRepository
 	hub          *ChargingHub
@@ -105,23 +112,13 @@ type StopChargingResponse struct {
 	EndedAt        string  `json:"ended_at"`
 }
 
-func NewChargingHandler(db *sqlx.DB, ocppServer *ocpp.Server) *ChargingHandler {
-	h := &ChargingHandler{
-		ocppServer:   ocppServer,
+func NewChargingHandler(db *sqlx.DB, gateway charging.GatewayClient) *ChargingHandler {
+	return &ChargingHandler{
+		gateway:      gateway,
 		walletRepo:   repositories.NewWalletRepository(db),
 		chargingRepo: repositories.NewChargingRepository(db),
 		hub:          NewChargingHub(),
 	}
-
-	ocppServer.SetCallbacks(ocpp.Callbacks{
-		OnRemoteStartResult: h.onRemoteStartResult,
-		OnRemoteStopResult:  h.onRemoteStopResult,
-		OnStartTransaction:  h.onStartTransaction,
-		OnMeterValues:       h.onMeterValues,
-		OnStopTransaction:   h.onStopTransaction,
-	})
-
-	return h
 }
 
 // VerifyCharger godoc
@@ -148,12 +145,21 @@ func (h *ChargingHandler) VerifyCharger(c *gin.Context) {
 		return
 	}
 
-	if !h.ocppServer.Registry.IsConnected(req.ChargerID) {
+	connected, err := h.gateway.IsConnected(c.Request.Context(), req.ChargerID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify charger connectivity"})
+		return
+	}
+	if !connected {
 		c.JSON(http.StatusNotFound, gin.H{"error": "charger not connected"})
 		return
 	}
 
-	status, ok := h.ocppServer.Registry.GetStatus(req.ChargerID, req.ConnectorID)
+	status, ok, err := h.gateway.GetConnectorStatus(c.Request.Context(), req.ChargerID, req.ConnectorID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch connector status"})
+		return
+	}
 	if !ok {
 		c.JSON(http.StatusConflict, gin.H{"error": "connector status unknown"})
 		return
@@ -219,12 +225,21 @@ func (h *ChargingHandler) StartCharging(c *gin.Context) {
 		return
 	}
 
-	if !h.ocppServer.Registry.IsConnected(req.ChargerID) {
+	connected, err := h.gateway.IsConnected(c.Request.Context(), req.ChargerID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify charger connectivity"})
+		return
+	}
+	if !connected {
 		c.JSON(http.StatusNotFound, gin.H{"error": "charger not connected"})
 		return
 	}
 
-	status, ok := h.ocppServer.Registry.GetStatus(req.ChargerID, req.ConnectorID)
+	status, ok, err := h.gateway.GetConnectorStatus(c.Request.Context(), req.ChargerID, req.ConnectorID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch connector status"})
+		return
+	}
 	log.Println("Charger status for", ok, "is", status)
 	if !ok || status != "Available" {
 		c.JSON(http.StatusConflict, gin.H{"error": "charger not available"})
@@ -249,12 +264,10 @@ func (h *ChargingHandler) StartCharging(c *gin.Context) {
 		return
 	}
 
-	messageID, err := h.ocppServer.SendRemoteStartTransaction(req.ChargerID, req.ConnectorID, userID)
-	if err != nil {
+	if err := h.gateway.RemoteStart(c.Request.Context(), session.ID, req.ChargerID, req.ConnectorID, userID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start charger"})
 		return
 	}
-	h.ocppServer.RegisterPending(messageID, "RemoteStartTransaction", session.ID)
 
 	h.hub.Publish(session.ID, gin.H{"status": "starting", "charger_name": req.ChargerID})
 
@@ -309,12 +322,10 @@ func (h *ChargingHandler) StopCharging(c *gin.Context) {
 		return
 	}
 
-	messageID, err := h.ocppServer.SendRemoteStopTransaction(session.ChargerID, session.TransactionID)
-	if err != nil {
+	if err := h.gateway.RemoteStop(c.Request.Context(), session.ID, session.ChargerID, session.TransactionID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to stop charger"})
 		return
 	}
-	h.ocppServer.RegisterPending(messageID, "RemoteStopTransaction", session.ID)
 
 	if err := h.chargingRepo.UpdateSessionStatus(session.ID, "stopping"); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update session"})
@@ -448,6 +459,118 @@ func (h *ChargingHandler) LiveUpdatesWS(c *gin.Context) {
 	}
 }
 
+type ocppWebhookEnvelope struct {
+	EventType string          `json:"event_type"`
+	Data      json.RawMessage `json:"data"`
+}
+
+type remoteStartResultEvent struct {
+	SessionID string `json:"session_id"`
+	Accepted  bool   `json:"accepted"`
+}
+
+type remoteStopResultEvent struct {
+	SessionID string `json:"session_id"`
+	Accepted  bool   `json:"accepted"`
+}
+
+type startTransactionEvent struct {
+	ChargePointID string  `json:"charge_point_id"`
+	ConnectorID   int     `json:"connector_id"`
+	TransactionID int     `json:"transaction_id"`
+	MeterStartKwh float64 `json:"meter_start_kwh"`
+}
+
+type meterValuesEvent struct {
+	ChargePointID string  `json:"charge_point_id"`
+	ConnectorID   int     `json:"connector_id"`
+	TransactionID int     `json:"transaction_id"`
+	EnergyKwh     float64 `json:"energy_kwh"`
+}
+
+type stopTransactionEvent struct {
+	ChargePointID string  `json:"charge_point_id"`
+	TransactionID int     `json:"transaction_id"`
+	MeterStopKwh  float64 `json:"meter_stop_kwh"`
+}
+
+// OCPPWebhook godoc
+// @Summary OCPP event webhook
+// @Description Receives asynchronous charging events from external OCPP service
+// @Tags webhooks
+// @Accept json
+// @Produce json
+// @Success 200 {object} map[string]string
+// @Failure 400 {object} map[string]string
+// @Failure 401 {object} map[string]string
+// @Failure 500 {object} map[string]string
+// @Router /webhooks/ocpp [post]
+func (h *ChargingHandler) OCPPWebhook(c *gin.Context) {
+	payload, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+
+	secret := os.Getenv("OCPP_WEBHOOK_SECRET")
+	if secret != "" {
+		signature := c.GetHeader("X-OCPP-Signature")
+		if signature == "" || !verifyOCPPWebhookSignature(payload, signature, secret) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid signature"})
+			return
+		}
+	}
+
+	var envelope ocppWebhookEnvelope
+	if err := json.Unmarshal(payload, &envelope); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid payload"})
+		return
+	}
+
+	switch envelope.EventType {
+	case "remote_start_result":
+		var evt remoteStartResultEvent
+		if err := json.Unmarshal(envelope.Data, &evt); err != nil || evt.SessionID == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid remote_start_result payload"})
+			return
+		}
+		h.onRemoteStartResult(evt.SessionID, evt.Accepted)
+	case "remote_stop_result":
+		var evt remoteStopResultEvent
+		if err := json.Unmarshal(envelope.Data, &evt); err != nil || evt.SessionID == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid remote_stop_result payload"})
+			return
+		}
+		h.onRemoteStopResult(evt.SessionID, evt.Accepted)
+	case "start_transaction":
+		var evt startTransactionEvent
+		if err := json.Unmarshal(envelope.Data, &evt); err != nil || evt.ChargePointID == "" || evt.ConnectorID <= 0 || evt.TransactionID <= 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid start_transaction payload"})
+			return
+		}
+		h.onStartTransaction(evt.ChargePointID, evt.ConnectorID, evt.TransactionID, evt.MeterStartKwh)
+	case "meter_values":
+		var evt meterValuesEvent
+		if err := json.Unmarshal(envelope.Data, &evt); err != nil || evt.ChargePointID == "" || evt.ConnectorID <= 0 || evt.TransactionID <= 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid meter_values payload"})
+			return
+		}
+		h.onMeterValues(evt.ChargePointID, evt.ConnectorID, evt.TransactionID, evt.EnergyKwh)
+	case "stop_transaction":
+		var evt stopTransactionEvent
+		if err := json.Unmarshal(envelope.Data, &evt); err != nil || evt.ChargePointID == "" || evt.TransactionID <= 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid stop_transaction payload"})
+			return
+		}
+		h.onStopTransaction(evt.ChargePointID, evt.TransactionID, evt.MeterStopKwh)
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported event_type"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
 func (h *ChargingHandler) onRemoteStartResult(sessionID string, accepted bool) {
 	if accepted {
 		return
@@ -520,4 +643,19 @@ func (h *ChargingHandler) onStopTransaction(cpID string, transactionID int, mete
 
 func roundToTwoCharging(val float64) float64 {
 	return math.Round(val*100) / 100
+}
+
+func verifyOCPPWebhookSignature(payload []byte, signature string, secret string) bool {
+	signature = strings.TrimSpace(signature)
+	signature = strings.TrimPrefix(signature, "sha256=")
+
+	expectedMAC := hmac.New(sha256.New, []byte(secret))
+	expectedMAC.Write(payload)
+	expected := expectedMAC.Sum(nil)
+
+	decodedSig, err := hex.DecodeString(signature)
+	if err != nil {
+		return false
+	}
+	return hmac.Equal(decodedSig, expected)
 }
