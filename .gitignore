@@ -9,7 +9,7 @@
 /vendor/
 
 # Environment files
-.env
+# .env
 
 # Swagger generated files (optional)
 docs/swagger.json

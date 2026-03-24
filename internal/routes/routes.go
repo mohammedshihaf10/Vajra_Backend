@@ -27,6 +27,7 @@ func RegisterRoutes(r *gin.Engine, db *sqlx.DB) {
 	userHandler := handlers.NewUserHandler(db)
 	authHandler := handlers.NewAuthHandler(db)
 	walletHandler := handlers.NewWalletHandler(db)
+	publicHandler := handlers.NewPublicHandler(db)
 	ocppServer := ocpp.NewServer()
 	ocppServer.AttachDB(db.DB)
 	chargingHandler := handlers.NewChargingHandler(db, ocppServer)
@@ -56,6 +57,11 @@ func RegisterRoutes(r *gin.Engine, db *sqlx.DB) {
 		auth.POST("/logout", authHandler.Logout)
 		auth.POST("/refresh", authHandler.Refresh)
 		auth.POST("/send-otp", authHandler.SendOTP)
+	}
+
+	public := r.Group("/public")
+	{
+		public.GET("/data", publicHandler.ListPublicTableData)
 	}
 
 	secret := []byte(os.Getenv("JWT_SECRET"))
