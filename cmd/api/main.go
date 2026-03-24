@@ -8,6 +8,7 @@ import (
 	_ "vajraBackend/docs"
 	"vajraBackend/internal/config"
 	"vajraBackend/internal/db"
+	"vajraBackend/internal/middleware"
 	"vajraBackend/internal/routes"
 )
 
@@ -26,10 +27,11 @@ func main() {
 	// Gin router
 	r := gin.Default()
 	// includes: logger + recovery middleware
+	r.Use(middleware.ErrorTracker(database))
 
 	// Routes
 	routes.RegisterRoutes(r, database)
 
-	log.Println("🚀 Server running on :8080")
-	r.Run(":8080")
+	log.Println("🚀 Server running on 127.0.0.1:8080")
+	r.Run("127.0.0.1:8080")
 }

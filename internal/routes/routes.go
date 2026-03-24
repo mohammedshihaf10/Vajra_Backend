@@ -52,6 +52,11 @@ func RegisterRoutes(r *gin.Engine, db *sqlx.DB) {
 		auth.POST("/send-otp", authHandler.SendOTP)
 	}
 
+	// public := r.Group("/public")
+	// {
+	// 	public.GET("/data", publicHandler.ListPublicTableData)
+	// }
+
 	secret := []byte(os.Getenv("JWT_SECRET"))
 	protected := r.Group("/")
 	protected.Use(middleware.RequireAuth(secret))
