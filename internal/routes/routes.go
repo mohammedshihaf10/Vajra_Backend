@@ -29,6 +29,7 @@ func RegisterRoutes(r *gin.Engine, db *sqlx.DB) {
 	userHandler := handlers.NewUserHandler(db)
 	authHandler := handlers.NewAuthHandler(db)
 	walletHandler := handlers.NewWalletHandler(db)
+	publicHandler := handlers.NewPublicHandler(db)
 	ocppBaseURL := strings.TrimSpace(os.Getenv("OCPP_SERVICE_BASE_URL"))
 	if ocppBaseURL == "" {
 		log.Fatal("missing OCPP_SERVICE_BASE_URL")
@@ -52,10 +53,10 @@ func RegisterRoutes(r *gin.Engine, db *sqlx.DB) {
 		auth.POST("/send-otp", authHandler.SendOTP)
 	}
 
-	// public := r.Group("/public")
-	// {
-	// 	public.GET("/data", publicHandler.ListPublicTableData)
-	// }
+	public := r.Group("/public")
+	{
+		public.GET("/data", publicHandler.ListPublicTableData)
+	}
 
 	secret := []byte(os.Getenv("JWT_SECRET"))
 	protected := r.Group("/")
