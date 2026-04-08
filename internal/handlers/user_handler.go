@@ -35,9 +35,7 @@ func (h *UserHandler) CreateUser(c *gin.Context) {
 	var user models.User
 
 	if err := c.ShouldBindJSON(&user); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": err.Error(),
-		})
+		respondBadRequest(c, err)
 		return
 	}
 
@@ -49,9 +47,7 @@ func (h *UserHandler) CreateUser(c *gin.Context) {
 	}
 
 	if err := h.repo.Create(&user); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "could not create user",
-		})
+		respondWithError(c, http.StatusInternalServerError, "could not create user", err)
 		return
 	}
 
@@ -73,9 +69,7 @@ func (h *UserHandler) GetUserByEmail(c *gin.Context) {
 
 	user, err := h.repo.GetByEmail(email)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "failed to fetch user",
-		})
+		respondWithError(c, http.StatusInternalServerError, "failed to fetch user", err)
 		return
 	}
 
@@ -104,9 +98,7 @@ func (h *UserHandler) GetUser(c *gin.Context) {
 
 	user, err := h.repo.GetByID(id)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "failed to fetch user",
-		})
+		respondWithError(c, http.StatusInternalServerError, "failed to fetch user", err)
 		return
 	}
 

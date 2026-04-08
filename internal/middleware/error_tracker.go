@@ -2,11 +2,13 @@ package middleware
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"time"
 
@@ -55,7 +57,7 @@ func ErrorTracker(db *sqlx.DB) gin.HandlerFunc {
 					Route:        c.FullPath(),
 					Query:        c.Request.URL.RawQuery,
 					StatusCode:   statusCode,
-					ErrorMessage: fmt.Sprintf("panic: %v", rec),
+				ErrorMessage: buildErrorDump(c, statusCode, writer.body.String(), fmt.Sprintf("panic: %v", rec)),
 					RequestBody:  requestBody,
 					ResponseBody: truncateString(writer.body.String(), maxLoggedBodyBytes),
 					UserID:       contextString(c, "user_id"),
@@ -79,7 +81,7 @@ func ErrorTracker(db *sqlx.DB) gin.HandlerFunc {
 				Route:        c.FullPath(),
 				Query:        c.Request.URL.RawQuery,
 				StatusCode:   statusCode,
-				ErrorMessage: errorMessageFromContext(c, writer.body.String()),
+				ErrorMessage: buildErrorDump(c, statusCode, writer.body.String(), ""),
 				RequestBody:  requestBody,
 				ResponseBody: truncateString(writer.body.String(), maxLoggedBodyBytes),
 				UserID:       contextString(c, "user_id"),
@@ -158,21 +160,105 @@ func captureRequestBody(r *http.Request) string {
 	return truncateString(string(bodyBytes), maxLoggedBodyBytes)
 }
 
-func errorMessageFromContext(c *gin.Context, responseBody string) string {
-	if len(c.Errors) > 0 {
-		parts := make([]string, 0, len(c.Errors))
-		for _, err := range c.Errors {
-			if err == nil {
-				continue
-			}
-			parts = append(parts, err.Error())
-		}
-		if len(parts) > 0 {
-			return truncateString(strings.Join(parts, " | "), 4000)
-		}
+func buildErrorDump(c *gin.Context, statusCode int, responseBody string, panicMessage string) string {
+	parts := make([]string, 0, 6)
+	parts = append(parts, fmt.Sprintf("status=%d %s", statusCode, http.StatusText(statusCode)))
+
+	if panicMessage != "" {
+		parts = append(parts, panicMessage)
 	}
 
-	return truncateString(responseBody, 4000)
+	if ginErrors := ginErrorsFromContext(c); ginErrors != "" {
+		parts = append(parts, "gin_errors="+ginErrors)
+	}
+
+	if payloadSummary := summarizeResponseBody(responseBody); payloadSummary != "" {
+		parts = append(parts, "response="+payloadSummary)
+	}
+
+	if responseBody != "" {
+		parts = append(parts, "raw_response="+truncateString(responseBody, 2000))
+	}
+
+	return truncateString(strings.Join(parts, " | "), 4000)
+}
+
+func ginErrorsFromContext(c *gin.Context) string {
+	if len(c.Errors) == 0 {
+		return ""
+	}
+
+	parts := make([]string, 0, len(c.Errors))
+	for _, err := range c.Errors {
+		if err == nil {
+			continue
+		}
+		parts = append(parts, err.Error())
+	}
+
+	return truncateString(strings.Join(parts, " | "), 2000)
+}
+
+func summarizeResponseBody(responseBody string) string {
+	if responseBody == "" {
+		return ""
+	}
+
+	var payload interface{}
+	if err := json.Unmarshal([]byte(responseBody), &payload); err != nil {
+		return truncateString(responseBody, 1000)
+	}
+
+	switch typed := payload.(type) {
+	case map[string]interface{}:
+		return summarizeJSONObject(typed)
+	case []interface{}:
+		return fmt.Sprintf("json_array(len=%d)", len(typed))
+	default:
+		return truncateString(fmt.Sprintf("%v", typed), 1000)
+	}
+}
+
+func summarizeJSONObject(payload map[string]interface{}) string {
+	parts := make([]string, 0, 4)
+
+	if value := stringifyJSONValue(payload["error"]); value != "" {
+		parts = append(parts, "error="+value)
+	}
+	if value := stringifyJSONValue(payload["details"]); value != "" {
+		parts = append(parts, "details="+value)
+	}
+	if value := stringifyJSONValue(payload["message"]); value != "" {
+		parts = append(parts, "message="+value)
+	}
+
+	if len(parts) == 0 {
+		keys := make([]string, 0, len(payload))
+		for key := range payload {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		parts = append(parts, "json_keys="+strings.Join(keys, ","))
+	}
+
+	return truncateString(strings.Join(parts, ", "), 1000)
+}
+
+func stringifyJSONValue(value interface{}) string {
+	if value == nil {
+		return ""
+	}
+
+	switch typed := value.(type) {
+	case string:
+		return typed
+	default:
+		encoded, err := json.Marshal(typed)
+		if err != nil {
+			return fmt.Sprintf("%v", typed)
+		}
+		return string(encoded)
+	}
 }
 
 func requestIDFromContext(c *gin.Context) string {

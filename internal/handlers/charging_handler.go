@@ -139,7 +139,7 @@ func NewChargingHandler(db *sqlx.DB, ocppServer *ocpp.Server) *ChargingHandler {
 func (h *ChargingHandler) VerifyCharger(c *gin.Context) {
 	var req ChargerVerifyRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		respondBadRequest(c, err)
 		return
 	}
 
@@ -196,7 +196,7 @@ func (h *ChargingHandler) StartCharging(c *gin.Context) {
 
 	var req StartChargingRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		respondBadRequest(c, err)
 		return
 	}
 
@@ -207,7 +207,7 @@ func (h *ChargingHandler) StartCharging(c *gin.Context) {
 
 	wallet, err := h.walletRepo.GetWalletByUserID(userID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch wallet"})
+		respondWithError(c, http.StatusInternalServerError, "failed to fetch wallet", err)
 		return
 	}
 	if wallet == nil {
@@ -232,7 +232,7 @@ func (h *ChargingHandler) StartCharging(c *gin.Context) {
 	}
 
 	if err := h.chargingRepo.UpsertCharger(req.ChargerID, status); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to upsert charger"})
+		respondWithError(c, http.StatusInternalServerError, "failed to upsert charger", err)
 		return
 	}
 
@@ -245,13 +245,13 @@ func (h *ChargingHandler) StartCharging(c *gin.Context) {
 
 	if err := h.chargingRepo.CreateSession(session); err != nil {
 		log.Println("Error creating charging session:", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create session"})
+		respondWithError(c, http.StatusInternalServerError, "failed to create session", err)
 		return
 	}
 
 	messageID, err := h.ocppServer.SendRemoteStartTransaction(req.ChargerID, req.ConnectorID, userID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start charger"})
+		respondWithError(c, http.StatusInternalServerError, "failed to start charger", err)
 		return
 	}
 	h.ocppServer.RegisterPending(messageID, "RemoteStartTransaction", session.ID)
@@ -282,7 +282,7 @@ func (h *ChargingHandler) StopCharging(c *gin.Context) {
 
 	var req StopChargingRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		respondBadRequest(c, err)
 		return
 	}
 	if req.SessionID == "" {
@@ -292,7 +292,7 @@ func (h *ChargingHandler) StopCharging(c *gin.Context) {
 
 	session, err := h.chargingRepo.GetSessionByID(req.SessionID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch session"})
+		respondWithError(c, http.StatusInternalServerError, "failed to fetch session", err)
 		return
 	}
 	if session == nil {
@@ -311,13 +311,13 @@ func (h *ChargingHandler) StopCharging(c *gin.Context) {
 
 	messageID, err := h.ocppServer.SendRemoteStopTransaction(session.ChargerID, session.TransactionID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to stop charger"})
+		respondWithError(c, http.StatusInternalServerError, "failed to stop charger", err)
 		return
 	}
 	h.ocppServer.RegisterPending(messageID, "RemoteStopTransaction", session.ID)
 
 	if err := h.chargingRepo.UpdateSessionStatus(session.ID, "stopping"); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update session"})
+		respondWithError(c, http.StatusInternalServerError, "failed to update session", err)
 		return
 	}
 
@@ -344,7 +344,7 @@ func (h *ChargingHandler) GetSession(c *gin.Context) {
 
 	session, err := h.chargingRepo.GetSessionByID(id)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch session"})
+		respondWithError(c, http.StatusInternalServerError, "failed to fetch session", err)
 		return
 	}
 	if session == nil {
@@ -372,7 +372,7 @@ func (h *ChargingHandler) GetActiveSession(c *gin.Context) {
 
 	session, err := h.chargingRepo.GetActiveSessionByUserID(userID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch session"})
+		respondWithError(c, http.StatusInternalServerError, "failed to fetch session", err)
 		return
 	}
 	if session == nil {
@@ -414,7 +414,7 @@ func (h *ChargingHandler) ListSessions(c *gin.Context) {
 
 	sessions, err := h.chargingRepo.ListSessionsByUserID(userID, status)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch sessions"})
+		respondWithError(c, http.StatusInternalServerError, "failed to fetch sessions", err)
 		return
 	}
 
