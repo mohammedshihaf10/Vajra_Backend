@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -31,6 +32,7 @@ func RequireAuth(secret []byte) gin.HandlerFunc {
 
 		claims, err := auth.ParseAndVerify(parts[1], secret)
 		if err != nil {
+			_ = c.Error(fmt.Errorf("authorization failed: %w", err))
 			c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 			c.Abort()
 			return

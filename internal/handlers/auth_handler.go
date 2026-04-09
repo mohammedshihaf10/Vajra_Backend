@@ -83,24 +83,24 @@ func (h *AuthHandler) Register(c *gin.Context) {
 	}
 
 	if err := h.repo.Create(&user); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not create user"})
+		respondWithInternalError(c, "could not create user", err)
 		return
 	}
 
 	accessToken, accessExp, err := auth.GenerateToken(user.ID, accessTTL, h.secret)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate access token"})
+		respondWithInternalError(c, "failed to generate access token", err)
 		return
 	}
 
 	refreshToken, refreshExp, err := auth.GenerateToken(user.ID, refreshTTL, h.secret)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate refresh token"})
+		respondWithInternalError(c, "failed to generate refresh token", err)
 		return
 	}
 
 	if err := h.repo.SetAuthToken(user.ID, refreshToken, refreshExp); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store refresh token"})
+		respondWithInternalError(c, "failed to store refresh token", err)
 		return
 	}
 
@@ -138,7 +138,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	valid, err := h.repo.VerifyPhoneOTP(req.PhoneNumber, req.OTP)
 	log.Println("OTP verification result:", valid, "error:", err) // Debug log
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify otp"})
+		respondWithInternalError(c, "failed to verify otp", err)
 		return
 	}
 	if !valid {
@@ -149,7 +149,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	user, err := h.repo.GetByPhoneNumber(req.PhoneNumber)
 	log.Println("Fetched user:", user, "error:", err) // Debug log
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch user"})
+		respondWithInternalError(c, "failed to fetch user", err)
 		return
 	}
 
@@ -163,30 +163,30 @@ func (h *AuthHandler) Login(c *gin.Context) {
 			PhoneNumber: req.PhoneNumber,
 		}
 		if err := h.repo.Create(user); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not create user"})
+			respondWithInternalError(c, "could not create user", err)
 			return
 		}
 	}
 
 	if err := h.repo.MarkPhoneVerified(user.ID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify phone"})
+		respondWithInternalError(c, "failed to verify phone", err)
 		return
 	}
 
 	accessToken, accessExp, err := auth.GenerateToken(user.ID, accessTTL, h.secret)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate access token"})
+		respondWithInternalError(c, "failed to generate access token", err)
 		return
 	}
 
 	refreshToken, refreshExp, err := auth.GenerateToken(user.ID, refreshTTL, h.secret)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate refresh token"})
+		respondWithInternalError(c, "failed to generate refresh token", err)
 		return
 	}
 
 	if err := h.repo.SetAuthToken(user.ID, refreshToken, refreshExp); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store refresh token"})
+		respondWithInternalError(c, "failed to store refresh token", err)
 		return
 	}
 
@@ -203,6 +203,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 // @Tags auth
 // @Accept json
 // @Produce json
+// @Security BearerAuth
 // @Param body body handlers.RefreshRequest true "Refresh payload"
 // @Success 200 {object} map[string]string
 // @Failure 400 {object} map[string]string
@@ -222,7 +223,7 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 
 	user, err := h.repo.GetByAuthToken(req.RefreshToken)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch user"})
+		respondWithInternalError(c, "failed to fetch user", err)
 		return
 	}
 
@@ -232,7 +233,7 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 	}
 
 	if err := h.repo.ClearAuthToken(user.ID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to revoke token"})
+		respondWithInternalError(c, "failed to revoke token", err)
 		return
 	}
 
@@ -265,7 +266,7 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 
 	user, err := h.repo.GetByAuthToken(req.RefreshToken)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch user"})
+		respondWithInternalError(c, "failed to fetch user", err)
 		return
 	}
 	if user == nil {
@@ -285,18 +286,18 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 
 	accessToken, accessExp, err := auth.GenerateToken(user.ID, accessTTL, h.secret)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate access token"})
+		respondWithInternalError(c, "failed to generate access token", err)
 		return
 	}
 
 	refreshToken, refreshExp, err := auth.GenerateToken(user.ID, refreshTTL, h.secret)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate refresh token"})
+		respondWithInternalError(c, "failed to generate refresh token", err)
 		return
 	}
 
 	if err := h.repo.SetAuthToken(user.ID, refreshToken, refreshExp); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store refresh token"})
+		respondWithInternalError(c, "failed to store refresh token", err)
 		return
 	}
 
@@ -312,6 +313,7 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 // @Description Fetch the user tied to the access token
 // @Tags auth
 // @Produce json
+// @Security BearerAuth
 // @Success 200 {object} models.User
 // @Failure 401 {object} map[string]string
 // @Failure 404 {object} map[string]string
@@ -328,7 +330,7 @@ func (h *AuthHandler) Me(c *gin.Context) {
 	user, err := h.repo.GetByID(userID)
 	log.Println("Fetched user in Me endpoint:", user, "error:", err) // Debug log
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch user"})
+		respondWithInternalError(c, "failed to fetch user", err)
 		return
 	}
 
@@ -365,13 +367,13 @@ func (h *AuthHandler) SendOTP(c *gin.Context) {
 
 	code, err := generateNumericOTP(6)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate otp"})
+		respondWithInternalError(c, "failed to generate otp", err)
 		return
 	}
 
 	expiresAt := time.Now().Add(5 * time.Minute)
 	if err := h.repo.SetPhoneOTP(req.PhoneNumber, code, expiresAt); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store otp"})
+		respondWithInternalError(c, "failed to store otp", err)
 		return
 	}
 	// if err := sendFast2SMS(req.PhoneNumber, code); err != nil {

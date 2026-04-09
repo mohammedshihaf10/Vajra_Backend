@@ -56,6 +56,7 @@ func NewWalletHandler(db *sqlx.DB) *WalletHandler {
 // @Tags wallet
 // @Accept json
 // @Produce json
+// @Security BearerAuth
 // @Param body body handlers.TopupInitiateRequest true "Topup payload"
 // @Success 200 {object} handlers.TopupInitiateResponse
 // @Failure 400 {object} map[string]string
@@ -83,7 +84,7 @@ func (h *WalletHandler) InitiateTopup(c *gin.Context) {
 
 	user, err := h.userRepo.GetByID(userID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch user"})
+		respondWithInternalError(c, "failed to fetch user", err)
 		return
 	}
 	if user == nil || strings.ToLower(user.Status) != "active" {
@@ -93,7 +94,7 @@ func (h *WalletHandler) InitiateTopup(c *gin.Context) {
 
 	wallet, err := h.walletRepo.GetWalletByUserID(userID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch wallet"})
+		respondWithInternalError(c, "failed to fetch wallet", err)
 		return
 	}
 	if wallet == nil {
@@ -108,14 +109,14 @@ func (h *WalletHandler) InitiateTopup(c *gin.Context) {
 	orderID, currency, err := createRazorpayOrder(req.Amount)
 	log.Println("Razorpay order created with ID:", orderID, "currency:", currency, "error:", err)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create payment order"})
+		respondWithInternalError(c, "failed to create payment order", err)
 		return
 	}
 
 	_, err = h.walletRepo.CreateTopupIntent(userID, wallet.ID, req.Amount, currency, orderID)
 	log.Println("Topup intent created for order ID:", orderID, "error:", err)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store topup intent"})
+		respondWithInternalError(c, "failed to store topup intent", err)
 		return
 	}
 
@@ -131,6 +132,7 @@ func (h *WalletHandler) InitiateTopup(c *gin.Context) {
 // @Summary Get wallet balance
 // @Tags wallet
 // @Produce json
+// @Security BearerAuth
 // @Success 200 {object} map[string]interface{}
 // @Failure 401 {object} map[string]string
 // @Failure 404 {object} map[string]string
@@ -145,7 +147,7 @@ func (h *WalletHandler) GetBalance(c *gin.Context) {
 
 	wallet, err := h.walletRepo.GetWalletByUserID(userID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch wallet"})
+		respondWithInternalError(c, "failed to fetch wallet", err)
 		return
 	}
 	if wallet == nil {
@@ -165,6 +167,7 @@ func (h *WalletHandler) GetBalance(c *gin.Context) {
 // @Summary Get wallet transactions
 // @Tags wallet
 // @Produce json
+// @Security BearerAuth
 // @Param limit query int false "Max number of transactions"
 // @Success 200 {array} models.WalletTransaction
 // @Failure 401 {object} map[string]string
@@ -180,7 +183,7 @@ func (h *WalletHandler) GetTransactions(c *gin.Context) {
 
 	wallet, err := h.walletRepo.GetWalletByUserID(userID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch wallet"})
+		respondWithInternalError(c, "failed to fetch wallet", err)
 		return
 	}
 	if wallet == nil {
@@ -197,7 +200,7 @@ func (h *WalletHandler) GetTransactions(c *gin.Context) {
 
 	transactions, err := h.walletRepo.ListTransactions(wallet.ID, limit)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch transactions"})
+		respondWithInternalError(c, "failed to fetch transactions", err)
 		return
 	}
 
@@ -226,7 +229,7 @@ func (h *WalletHandler) PaymentWebhook(c *gin.Context) {
 	payload, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		log.Printf("webhook: failed to read body: %v", err)
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		respondWithError(c, http.StatusBadRequest, "invalid body", err)
 		return
 	}
 
@@ -246,7 +249,7 @@ func (h *WalletHandler) PaymentWebhook(c *gin.Context) {
 	var hook razorpayWebhook
 	if err := json.Unmarshal(payload, &hook); err != nil {
 		log.Printf("webhook: invalid payload json: %v", err)
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid payload"})
+		respondWithError(c, http.StatusBadRequest, "invalid payload", err)
 		return
 	}
 
@@ -269,7 +272,7 @@ func (h *WalletHandler) PaymentWebhook(c *gin.Context) {
 			return
 		}
 		log.Printf("webhook: processing failed: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		respondWithExactError(c, http.StatusInternalServerError, err, "failed to process webhook")
 		return
 	}
 

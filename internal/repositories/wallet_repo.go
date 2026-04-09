@@ -10,6 +10,8 @@ import (
 )
 
 var ErrTopupNotFound = errors.New("topup not found")
+var ErrWalletNotFound = errors.New("wallet not found")
+var ErrInsufficientBalance = errors.New("insufficient wallet balance")
 
 type WalletRepository struct {
 	db *sqlx.DB
@@ -166,10 +168,6 @@ func (r *WalletRepository) ProcessTopupWebhook(orderID, paymentID, status, curre
 }
 
 func (r *WalletRepository) DebitWalletForSession(userID string, amount float64, sessionID string) error {
-	if amount <= 0 {
-		return nil
-	}
-
 	tx, err := r.db.Beginx()
 	if err != nil {
 		return err
@@ -177,6 +175,18 @@ func (r *WalletRepository) DebitWalletForSession(userID string, amount float64, 
 	defer func() {
 		_ = tx.Rollback()
 	}()
+
+	_, err = r.DebitWalletForSessionTx(tx, userID, amount, sessionID)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (r *WalletRepository) DebitWalletForSessionTx(tx *sqlx.Tx, userID string, amount float64, sessionID string) (bool, error) {
+	if amount <= 0 {
+		return false, nil
+	}
 
 	wallet := models.Wallet{}
 	walletQuery := `
@@ -186,15 +196,18 @@ func (r *WalletRepository) DebitWalletForSession(userID string, amount float64, 
 		FOR UPDATE
 	`
 	if err := tx.Get(&wallet, walletQuery, userID); err != nil {
-		return err
+		if err == sql.ErrNoRows {
+			return false, ErrWalletNotFound
+		}
+		return false, err
 	}
 
 	if wallet.Status != "active" {
-		return errors.New("wallet is not active")
+		return false, errors.New("wallet is not active")
 	}
 
 	if wallet.Balance < amount {
-		return errors.New("insufficient balance")
+		return false, ErrInsufficientBalance
 	}
 
 	insertQuery := `
@@ -206,12 +219,12 @@ func (r *WalletRepository) DebitWalletForSession(userID string, amount float64, 
 	`
 	result, err := tx.Exec(insertQuery, wallet.ID, amount, wallet.Currency, sessionID)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	affected, err := result.RowsAffected()
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	if affected > 0 {
@@ -221,14 +234,9 @@ func (r *WalletRepository) DebitWalletForSession(userID string, amount float64, 
 			WHERE id = $2
 		`
 		if _, err := tx.Exec(updateWallet, amount, wallet.ID); err != nil {
-			return err
+			return false, err
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-
-	return nil
+	return affected > 0, nil
 }
-

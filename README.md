@@ -4,5 +4,31 @@ run:
 swagger:
 	swag init -g cmd/api/main.go
 
+charging:
+	required env:
+	`CITRINE_BASE_URL`
+	`CITRINE_TENANT_ID`
+	`CITRINE_CALLBACK_URL`
+	optional:
+	`CITRINE_ID_TOKEN_TYPE`
+	optional:
+	`CITRINE_API_KEY`
+	`CITRINE_TIMEOUT`
+	`CITRINE_MAX_RETRIES`
+	`CHARGING_START_TIMEOUT`
+	`CHARGING_RETRY_MAX_ATTEMPTS`
+	`OCPP_WEBHOOK_SECRET`
+	`CHARGING_STATUS_GRAPHQL_URL`
+	`HASURA_GRAPHQL_ADMIN_SECRET`
+	`HASURA_GRAPHQL_BEARER_TOKEN`
+	legacy env names still accepted:
+	`OCPP_SERVICE_BASE_URL`
+	`OCPP_SERVICE_TENANT_ID`
+	`OCPP_SERVICE_API_KEY`
+	`CHARGING_WEBHOOK_URL`
+
+design:
+	see `docs/charging_integration.md`
+
 migrate-up:
-	migrate -database "$(DB_DSN)" -path migrations up
+	migrate -database "$DB_DSN" -path migrations up

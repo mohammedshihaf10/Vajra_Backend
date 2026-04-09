@@ -91,7 +91,7 @@ func (h *PublicHandler) ListPublicTableData(c *gin.Context) {
 
 	rows, err := h.db.Queryx(query, limit, offset)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query table"})
+		respondWithInternalError(c, "failed to query table", err)
 		return
 	}
 	defer rows.Close()
@@ -100,14 +100,14 @@ func (h *PublicHandler) ListPublicTableData(c *gin.Context) {
 	for rows.Next() {
 		row := map[string]interface{}{}
 		if err := rows.MapScan(row); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to scan rows"})
+			respondWithInternalError(c, "failed to scan rows", err)
 			return
 		}
 		data = append(data, row)
 	}
 
 	if err := rows.Err(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read rows"})
+		respondWithInternalError(c, "failed to read rows", err)
 		return
 	}
 

@@ -2,11 +2,13 @@ package middleware
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"time"
 
@@ -79,7 +81,7 @@ func ErrorTracker(db *sqlx.DB) gin.HandlerFunc {
 				Route:        c.FullPath(),
 				Query:        c.Request.URL.RawQuery,
 				StatusCode:   statusCode,
-				ErrorMessage: errorMessageFromContext(c, writer.body.String()),
+				ErrorMessage: errorMessageFromContext(c, statusCode, writer.body.String()),
 				RequestBody:  requestBody,
 				ResponseBody: truncateString(writer.body.String(), maxLoggedBodyBytes),
 				UserID:       contextString(c, "user_id"),
@@ -158,21 +160,79 @@ func captureRequestBody(r *http.Request) string {
 	return truncateString(string(bodyBytes), maxLoggedBodyBytes)
 }
 
-func errorMessageFromContext(c *gin.Context, responseBody string) string {
+func errorMessageFromContext(c *gin.Context, statusCode int, responseBody string) string {
+	sections := []string{
+		fmt.Sprintf("status_code=%d", statusCode),
+	}
+
 	if len(c.Errors) > 0 {
-		parts := make([]string, 0, len(c.Errors))
+		errorLines := make([]string, 0, len(c.Errors))
 		for _, err := range c.Errors {
 			if err == nil {
 				continue
 			}
-			parts = append(parts, err.Error())
+			errorLines = append(errorLines, err.Error())
 		}
-		if len(parts) > 0 {
-			return truncateString(strings.Join(parts, " | "), 4000)
+		if len(errorLines) > 0 {
+			sections = append(sections, "gin_errors:\n- "+strings.Join(errorLines, "\n- "))
 		}
 	}
 
-	return truncateString(responseBody, 4000)
+	if responseError := extractResponseError(responseBody); responseError != "" {
+		sections = append(sections, "response_error="+responseError)
+	}
+
+	responseBody = strings.TrimSpace(responseBody)
+	if responseBody != "" {
+		sections = append(sections, "response_body="+responseBody)
+	}
+
+	if len(sections) == 1 {
+		sections = append(sections, "response_body=<empty>")
+	}
+
+	return truncateString(strings.Join(sections, "\n"), 4000)
+}
+
+func extractResponseError(responseBody string) string {
+	responseBody = strings.TrimSpace(responseBody)
+	if responseBody == "" {
+		return ""
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(responseBody), &payload); err != nil {
+		return ""
+	}
+
+	keys := []string{"error", "message", "details"}
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		value, ok := payload[key]
+		if !ok || value == nil {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s=%v", key, value))
+	}
+
+	if len(parts) > 0 {
+		return strings.Join(parts, ", ")
+	}
+
+	remainingKeys := make([]string, 0, len(payload))
+	for key := range payload {
+		remainingKeys = append(remainingKeys, key)
+	}
+	sort.Strings(remainingKeys)
+
+	for _, key := range remainingKeys {
+		if payload[key] == nil {
+			continue
+		}
+		return fmt.Sprintf("%s=%v", key, payload[key])
+	}
+
+	return ""
 }
 
 func requestIDFromContext(c *gin.Context) string {

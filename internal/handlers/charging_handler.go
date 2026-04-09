@@ -1,17 +1,19 @@
 package handlers
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
-	"log"
-	"math"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -22,16 +24,11 @@ import (
 	"vajraBackend/internal/repositories"
 )
 
-const (
-	minStartBalance = 10.0
-	costPerKwh      = 24.90
-)
-
 type ChargingHandler struct {
-	gateway      charging.GatewayClient
-	walletRepo   *repositories.WalletRepository
+	service      *charging.Service
 	chargingRepo *repositories.ChargingRepository
 	hub          *ChargingHub
+	logger       *slog.Logger
 }
 
 type ChargingHub struct {
@@ -68,7 +65,7 @@ func (h *ChargingHub) Remove(sessionID string, conn *websocket.Conn) {
 	}
 }
 
-func (h *ChargingHub) Publish(sessionID string, payload interface{}) {
+func (h *ChargingHub) Publish(sessionID string, payload any) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	for conn := range h.conns[sessionID] {
@@ -77,23 +74,21 @@ func (h *ChargingHub) Publish(sessionID string, payload interface{}) {
 }
 
 type ChargerVerifyRequest struct {
-	ChargerID   string `json:"charger_id"`
-	ConnectorID int    `json:"connector_id"`
+	ChargerID   string `json:"charger_id" binding:"required"`
+	ConnectorID int    `json:"connector_id" binding:"required,min=1"`
 }
 
-type ChargerVerifyResponse struct {
-	ChargerID   string  `json:"charger_id"`
-	ConnectorID int     `json:"connector_id"`
-	Status      string  `json:"status"`
-	Available   bool    `json:"available"`
-	ChargerType string  `json:"charger_type"`
-	PowerKW     float64 `json:"power_kw"`
-	Location    string  `json:"location"`
+type ChargerStatusResponse struct {
+	ChargerID   string `json:"charger_id"`
+	ConnectorID int    `json:"connector_id"`
+	Status      string `json:"status"`
+	Available   bool   `json:"available"`
+	LastSeen    string `json:"last_seen"`
 }
 
 type StartChargingRequest struct {
-	ChargerID   string `json:"charger_id"`
-	ConnectorID int    `json:"connector_id"`
+	ChargerID   string `json:"charger_id" binding:"required"`
+	ConnectorID int    `json:"connector_id" binding:"required,min=1"`
 }
 
 type StartChargingResponse struct {
@@ -102,37 +97,29 @@ type StartChargingResponse struct {
 }
 
 type StopChargingRequest struct {
-	SessionID string `json:"session_id"`
+	SessionID string `json:"session_id" binding:"required"`
 }
 
 type StopChargingResponse struct {
+	SessionID      string  `json:"session_id"`
 	Status         string  `json:"status"`
-	FinalEnergyKwh float64 `json:"final_energy_kwh"`
-	FinalCost      float64 `json:"final_cost"`
-	EndedAt        string  `json:"ended_at"`
+	FinalEnergyKwh float64 `json:"final_energy_kwh,omitempty"`
+	FinalCost      float64 `json:"final_cost,omitempty"`
+	FailureReason  string  `json:"failure_reason,omitempty"`
 }
 
-func NewChargingHandler(db *sqlx.DB, gateway charging.GatewayClient) *ChargingHandler {
-	return &ChargingHandler{
-		gateway:      gateway,
-		walletRepo:   repositories.NewWalletRepository(db),
+func NewChargingHandler(db *sqlx.DB, service *charging.Service) *ChargingHandler {
+	handler := &ChargingHandler{
+		service:      service,
 		chargingRepo: repositories.NewChargingRepository(db),
 		hub:          NewChargingHub(),
+		logger:       slog.Default().With("component", "charging_handler"),
 	}
+
+	go handler.runRecoveryLoop()
+	return handler
 }
 
-// VerifyCharger godoc
-// @Summary Verify charger availability
-// @Tags charging
-// @Accept json
-// @Produce json
-// @Param body body handlers.ChargerVerifyRequest true "Verify payload"
-// @Success 200 {object} handlers.ChargerVerifyResponse
-// @Failure 400 {object} map[string]string
-// @Failure 404 {object} map[string]string
-// @Failure 409 {object} map[string]string
-// @Failure 500 {object} map[string]string
-// @Router /chargers/verify [post]
 func (h *ChargingHandler) VerifyCharger(c *gin.Context) {
 	var req ChargerVerifyRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -140,59 +127,60 @@ func (h *ChargingHandler) VerifyCharger(c *gin.Context) {
 		return
 	}
 
-	if req.ChargerID == "" || req.ConnectorID <= 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "charger_id and connector_id are required"})
-		return
-	}
-
-	connected, err := h.gateway.IsConnected(c.Request.Context(), req.ChargerID)
+	connector, err := h.service.ResolveConnectorStatus(c.Request.Context(), req.ChargerID, req.ConnectorID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify charger connectivity"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch charger status"})
 		return
 	}
-	if !connected {
-		c.JSON(http.StatusNotFound, gin.H{"error": "charger not connected"})
+	if connector == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "connector status unknown"})
 		return
 	}
 
-	status, ok, err := h.gateway.GetConnectorStatus(c.Request.Context(), req.ChargerID, req.ConnectorID)
+	c.JSON(http.StatusOK, ChargerStatusResponse{
+		ChargerID:   connector.ChargerID,
+		ConnectorID: connector.ConnectorID,
+		Status:      connector.Status,
+		Available:   strings.EqualFold(connector.Status, "Available"),
+		LastSeen:    connector.LastSeen,
+	})
+}
+
+func (h *ChargingHandler) GetChargerStatus(c *gin.Context) {
+	chargerID := c.Param("id")
+	if chargerID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing charger id"})
+		return
+	}
+
+	connectorID := 1
+	if raw := c.Query("connector_id"); raw != "" {
+		if _, err := fmtSscanf(raw, &connectorID); err != nil || connectorID <= 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid connector_id"})
+			return
+		}
+	}
+
+	connector, err := h.service.ResolveConnectorStatus(c.Request.Context(), chargerID, connectorID)
+	h.logger.Debug("fetching charger status", "connector", connector, "connector_id", connectorID, "error", err)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch connector status"})
 		return
 	}
-	if !ok {
-		c.JSON(http.StatusConflict, gin.H{"error": "connector status unknown"})
-		return
-	}
-	if status != "Available" {
-		c.JSON(http.StatusConflict, gin.H{"error": "charger not available"})
+	if connector == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "connector status unknown"})
 		return
 	}
 
-	c.JSON(http.StatusOK, ChargerVerifyResponse{
-		ChargerID:   req.ChargerID,
-		ConnectorID: req.ConnectorID,
-		Status:      status,
-		Available:   status == "Available",
-		ChargerType: "DC",
-		PowerKW:     30,
-		Location:    "Unknown",
+	c.JSON(http.StatusOK, ChargerStatusResponse{
+		ChargerID:   connector.ChargerID,
+		ConnectorID: connector.ConnectorID,
+		Status:      connector.Status,
+		Available:   strings.EqualFold(connector.Status, "Available"),
+		LastSeen:    connector.LastSeen,
 	})
 }
 
-// StartCharging godoc
-// @Summary Start charging session
-// @Tags charging
-// @Accept json
-// @Produce json
-// @Param body body handlers.StartChargingRequest true "Start payload"
-// @Success 200 {object} handlers.StartChargingResponse
-// @Failure 400 {object} map[string]string
-// @Failure 403 {object} map[string]string
-// @Failure 404 {object} map[string]string
-// @Failure 409 {object} map[string]string
-// @Failure 500 {object} map[string]string
-// @Router /charging/start [post]
 func (h *ChargingHandler) StartCharging(c *gin.Context) {
 	userID := c.GetString("user_id")
 	if userID == "" {
@@ -206,86 +194,56 @@ func (h *ChargingHandler) StartCharging(c *gin.Context) {
 		return
 	}
 
-	if req.ChargerID == "" || req.ConnectorID <= 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "charger_id and connector_id are required"})
-		return
-	}
-
-	wallet, err := h.walletRepo.GetWalletByUserID(userID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch wallet"})
-		return
-	}
-	if wallet == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "wallet not found"})
-		return
-	}
-	if wallet.Balance < minStartBalance {
-		c.JSON(http.StatusForbidden, gin.H{"error": "insufficient wallet balance"})
-		return
-	}
-
-	connected, err := h.gateway.IsConnected(c.Request.Context(), req.ChargerID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify charger connectivity"})
-		return
-	}
-	if !connected {
-		c.JSON(http.StatusNotFound, gin.H{"error": "charger not connected"})
-		return
-	}
-
-	status, ok, err := h.gateway.GetConnectorStatus(c.Request.Context(), req.ChargerID, req.ConnectorID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch connector status"})
-		return
-	}
-	log.Println("Charger status for", ok, "is", status)
-	if !ok || status != "Available" {
-		c.JSON(http.StatusConflict, gin.H{"error": "charger not available"})
-		return
-	}
-
-	if err := h.chargingRepo.UpsertCharger(req.ChargerID, status); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to upsert charger"})
-		return
-	}
-
-	session := &models.ChargingSession{
+	session, err := h.service.StartCharging(c.Request.Context(), charging.StartSessionInput{
+		UserID:      userID,
 		ChargerID:   req.ChargerID,
 		ConnectorID: req.ConnectorID,
-		UserID:      userID,
-		Status:      "starting",
-	}
-
-	if err := h.chargingRepo.CreateSession(session); err != nil {
-		log.Println("Error creating charging session:", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create session"})
+	})
+	if err != nil {
+		h.logger.Info("start charging rejected", "charger_id", req.ChargerID, "connector_id", req.ConnectorID, "error", err)
+		switch err {
+		case repositories.ErrWalletNotFound:
+			c.JSON(http.StatusNotFound, gin.H{
+				"error":   err.Error(),
+				"code":    "wallet_not_found",
+				"user_id": userID,
+			})
+		case repositories.ErrInsufficientBalance:
+			c.JSON(http.StatusForbidden, gin.H{
+				"error": err.Error(),
+				"code":  "insufficient_balance",
+			})
+		case repositories.ErrConnectorStatusUnknown:
+			c.JSON(http.StatusNotFound, gin.H{
+				"error":        err.Error(),
+				"code":         "connector_status_unknown",
+				"charger_id":   req.ChargerID,
+				"connector_id": req.ConnectorID,
+				"hint":         "No cached StatusNotification exists for this charger/connector yet. Send a status_notification webhook or query charger status after CitrineOS has populated availability.",
+			})
+		case repositories.ErrChargerOffline, repositories.ErrConnectorUnavailable, repositories.ErrActiveSessionExists, repositories.ErrConnectorBusy:
+			c.JSON(http.StatusConflict, gin.H{
+				"error":        err.Error(),
+				"code":         startConflictCode(err),
+				"charger_id":   req.ChargerID,
+				"connector_id": req.ConnectorID,
+			})
+		default:
+			h.logger.Error("start charging failed", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error":        "failed to start charging",
+				"code":         "charging_start_failed",
+				"charger_id":   req.ChargerID,
+				"connector_id": req.ConnectorID,
+			})
+		}
 		return
 	}
 
-	if err := h.gateway.RemoteStart(c.Request.Context(), session.ID, req.ChargerID, req.ConnectorID, userID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start charger"})
-		return
-	}
-
-	h.hub.Publish(session.ID, gin.H{"status": "starting", "charger_name": req.ChargerID})
-
-	c.JSON(http.StatusOK, StartChargingResponse{SessionID: session.ID, Status: "starting"})
+	h.hub.Publish(session.ID, sessionUpdatePayload(session))
+	c.JSON(http.StatusAccepted, StartChargingResponse{SessionID: session.ID, Status: session.Status})
 }
 
-// StopCharging godoc
-// @Summary Stop charging session
-// @Tags charging
-// @Accept json
-// @Produce json
-// @Param body body handlers.StopChargingRequest true "Stop payload"
-// @Success 200 {object} handlers.StopChargingResponse
-// @Failure 400 {object} map[string]string
-// @Failure 404 {object} map[string]string
-// @Failure 409 {object} map[string]string
-// @Failure 500 {object} map[string]string
-// @Router /charging/stop [post]
 func (h *ChargingHandler) StopCharging(c *gin.Context) {
 	userID := c.GetString("user_id")
 	if userID == "" {
@@ -298,54 +256,34 @@ func (h *ChargingHandler) StopCharging(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if req.SessionID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "session_id is required"})
-		return
-	}
 
-	session, err := h.chargingRepo.GetSessionByID(req.SessionID)
+	session, err := h.service.StopCharging(c.Request.Context(), charging.StopSessionInput{
+		UserID:    userID,
+		SessionID: req.SessionID,
+	})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch session"})
-		return
-	}
-	if session == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
-		return
-	}
-	if session.UserID != userID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
-		return
-	}
-
-	if session.TransactionID == 0 {
-		c.JSON(http.StatusConflict, gin.H{"error": "transaction_id not set yet"})
+		switch err {
+		case repositories.ErrSessionNotFound:
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		case repositories.ErrForbiddenSession:
+			c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+		case repositories.ErrSessionTerminal:
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		default:
+			h.logger.Error("stop charging failed", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to stop charging"})
+		}
 		return
 	}
 
-	if err := h.gateway.RemoteStop(c.Request.Context(), session.ID, session.ChargerID, session.TransactionID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to stop charger"})
-		return
-	}
-
-	if err := h.chargingRepo.UpdateSessionStatus(session.ID, "stopping"); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update session"})
-		return
-	}
-
-	h.hub.Publish(session.ID, gin.H{"status": "stopping", "charger_name": session.ChargerID})
-
-	c.JSON(http.StatusOK, StopChargingResponse{Status: "stopping"})
+	h.hub.Publish(session.ID, sessionUpdatePayload(session))
+	c.JSON(http.StatusAccepted, StopChargingResponse{
+		SessionID:     session.ID,
+		Status:        session.Status,
+		FailureReason: session.FailureReason,
+	})
 }
 
-// GetSession godoc
-// @Summary Get charging session
-// @Tags charging
-// @Produce json
-// @Param id path string true "Session ID"
-// @Success 200 {object} models.ChargingSession
-// @Failure 404 {object} map[string]string
-// @Failure 500 {object} map[string]string
-// @Router /charging/session/{id} [get]
 func (h *ChargingHandler) GetSession(c *gin.Context) {
 	id := c.Param("id")
 	if id == "" {
@@ -366,14 +304,6 @@ func (h *ChargingHandler) GetSession(c *gin.Context) {
 	c.JSON(http.StatusOK, session)
 }
 
-// GetActiveSession godoc
-// @Summary Get active charging session
-// @Tags charging
-// @Produce json
-// @Success 200 {object} models.ChargingSession
-// @Failure 404 {object} map[string]string
-// @Failure 500 {object} map[string]string
-// @Router /charging/active [get]
 func (h *ChargingHandler) GetActiveSession(c *gin.Context) {
 	userID := c.GetString("user_id")
 	if userID == "" {
@@ -394,15 +324,6 @@ func (h *ChargingHandler) GetActiveSession(c *gin.Context) {
 	c.JSON(http.StatusOK, session)
 }
 
-// ListSessions godoc
-// @Summary List charging sessions
-// @Tags charging
-// @Produce json
-// @Param status query string false "Filter by status"
-// @Success 200 {array} models.ChargingSession
-// @Failure 404 {object} map[string]string
-// @Failure 500 {object} map[string]string
-// @Router /charging/sessions [get]
 func (h *ChargingHandler) ListSessions(c *gin.Context) {
 	userID := c.GetString("user_id")
 	if userID == "" {
@@ -411,16 +332,8 @@ func (h *ChargingHandler) ListSessions(c *gin.Context) {
 	}
 
 	status := c.Query("status")
-	log.Println("Listing sessions with status filter:", status)
-	if status != "" {
-		switch status {
-		case "all":
-			status = ""
-		case "pending", "starting", "charging", "stopping", "stopped", "failed":
-		default:
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid status filter"})
-			return
-		}
+	if status == "all" {
+		status = ""
 	}
 
 	sessions, err := h.chargingRepo.ListSessionsByUserID(userID, status)
@@ -428,7 +341,6 @@ func (h *ChargingHandler) ListSessions(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch sessions"})
 		return
 	}
-
 	c.JSON(http.StatusOK, sessions)
 }
 
@@ -441,70 +353,25 @@ func (h *ChargingHandler) LiveUpdatesWS(c *gin.Context) {
 
 	conn, err := h.hub.upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
-		log.Printf("live ws: upgrade failed for session %s: %v", sessionID, err)
+		h.logger.Warn("websocket upgrade failed", "session_id", sessionID, "error", err)
 		return
 	}
 	defer conn.Close()
 
-	log.Printf("live ws: client connected session=%s", sessionID)
 	h.hub.Add(sessionID, conn)
 	defer h.hub.Remove(sessionID, conn)
-	defer log.Printf("live ws: client disconnected session=%s", sessionID)
+
+	if session, err := h.chargingRepo.GetSessionByID(sessionID); err == nil && session != nil {
+		_ = conn.WriteJSON(sessionUpdatePayload(session))
+	}
 
 	for {
 		if _, _, err := conn.ReadMessage(); err != nil {
-			log.Printf("live ws: read error session=%s: %v", sessionID, err)
 			return
 		}
 	}
 }
 
-type ocppWebhookEnvelope struct {
-	EventType string          `json:"event_type"`
-	Data      json.RawMessage `json:"data"`
-}
-
-type remoteStartResultEvent struct {
-	SessionID string `json:"session_id"`
-	Accepted  bool   `json:"accepted"`
-}
-
-type remoteStopResultEvent struct {
-	SessionID string `json:"session_id"`
-	Accepted  bool   `json:"accepted"`
-}
-
-type startTransactionEvent struct {
-	ChargePointID string  `json:"charge_point_id"`
-	ConnectorID   int     `json:"connector_id"`
-	TransactionID int     `json:"transaction_id"`
-	MeterStartKwh float64 `json:"meter_start_kwh"`
-}
-
-type meterValuesEvent struct {
-	ChargePointID string  `json:"charge_point_id"`
-	ConnectorID   int     `json:"connector_id"`
-	TransactionID int     `json:"transaction_id"`
-	EnergyKwh     float64 `json:"energy_kwh"`
-}
-
-type stopTransactionEvent struct {
-	ChargePointID string  `json:"charge_point_id"`
-	TransactionID int     `json:"transaction_id"`
-	MeterStopKwh  float64 `json:"meter_stop_kwh"`
-}
-
-// OCPPWebhook godoc
-// @Summary OCPP event webhook
-// @Description Receives asynchronous charging events from external OCPP service
-// @Tags webhooks
-// @Accept json
-// @Produce json
-// @Success 200 {object} map[string]string
-// @Failure 400 {object} map[string]string
-// @Failure 401 {object} map[string]string
-// @Failure 500 {object} map[string]string
-// @Router /webhooks/ocpp [post]
 func (h *ChargingHandler) OCPPWebhook(c *gin.Context) {
 	payload, err := io.ReadAll(c.Request.Body)
 	if err != nil {
@@ -521,141 +388,90 @@ func (h *ChargingHandler) OCPPWebhook(c *gin.Context) {
 		}
 	}
 
-	var envelope ocppWebhookEnvelope
+	var envelope charging.WebhookEnvelope
 	if err := json.Unmarshal(payload, &envelope); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid payload"})
 		return
 	}
+	if envelope.EventType == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing event_type"})
+		return
+	}
 
-	switch envelope.EventType {
-	case "remote_start_result":
-		var evt remoteStartResultEvent
-		if err := json.Unmarshal(envelope.Data, &evt); err != nil || evt.SessionID == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid remote_start_result payload"})
-			return
-		}
-		h.onRemoteStartResult(evt.SessionID, evt.Accepted)
-	case "remote_stop_result":
-		var evt remoteStopResultEvent
-		if err := json.Unmarshal(envelope.Data, &evt); err != nil || evt.SessionID == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid remote_stop_result payload"})
-			return
-		}
-		h.onRemoteStopResult(evt.SessionID, evt.Accepted)
-	case "start_transaction":
-		var evt startTransactionEvent
-		if err := json.Unmarshal(envelope.Data, &evt); err != nil || evt.ChargePointID == "" || evt.ConnectorID <= 0 || evt.TransactionID <= 0 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid start_transaction payload"})
-			return
-		}
-		h.onStartTransaction(evt.ChargePointID, evt.ConnectorID, evt.TransactionID, evt.MeterStartKwh)
-	case "meter_values":
-		var evt meterValuesEvent
-		if err := json.Unmarshal(envelope.Data, &evt); err != nil || evt.ChargePointID == "" || evt.ConnectorID <= 0 || evt.TransactionID <= 0 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid meter_values payload"})
-			return
-		}
-		h.onMeterValues(evt.ChargePointID, evt.ConnectorID, evt.TransactionID, evt.EnergyKwh)
-	case "stop_transaction":
-		var evt stopTransactionEvent
-		if err := json.Unmarshal(envelope.Data, &evt); err != nil || evt.ChargePointID == "" || evt.TransactionID <= 0 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid stop_transaction payload"})
-			return
-		}
-		h.onStopTransaction(evt.ChargePointID, evt.TransactionID, evt.MeterStopKwh)
-	default:
-		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported event_type"})
+	if err := h.service.ProcessWebhook(c.Request.Context(), payload, envelope, h.hub); err != nil {
+		h.logger.Error("webhook processing failed", "event_type", envelope.EventType, "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "webhook processing failed"})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
-func (h *ChargingHandler) onRemoteStartResult(sessionID string, accepted bool) {
-	if accepted {
-		return
-	}
-	_ = h.chargingRepo.UpdateSessionStatus(sessionID, "failed")
-	h.hub.Publish(sessionID, gin.H{"status": "failed"})
+func (h *ChargingHandler) ChargingMetrics(c *gin.Context) {
+	c.JSON(http.StatusOK, h.service.Metrics())
 }
 
-func (h *ChargingHandler) onRemoteStopResult(sessionID string, accepted bool) {
-	if accepted {
-		return
+func (h *ChargingHandler) runRecoveryLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		if err := h.service.RecoverStaleStarts(context.Background(), h.hub); err != nil {
+			h.logger.Error("stale start recovery failed", "error", err)
+		}
 	}
-	_ = h.chargingRepo.UpdateSessionStatus(sessionID, "charging")
-	h.hub.Publish(sessionID, gin.H{"status": "charging"})
 }
 
-func (h *ChargingHandler) onStartTransaction(cpID string, connectorID int, transactionID int, meterStartKwh float64) {
-	sessionID, err := h.chargingRepo.UpdateSessionForStartTransaction(cpID, connectorID, transactionID)
-	if err != nil || sessionID == "" {
-		return
+func sessionUpdatePayload(session *models.ChargingSession) map[string]any {
+	return map[string]any{
+		"session_id":     session.ID,
+		"status":         session.Status,
+		"energy_kwh":     session.EnergyKwh,
+		"cost":           session.Cost,
+		"transaction_id": session.TransactionRef,
+		"failure_reason": session.FailureReason,
+		"stop_requested": session.StopRequestedAt != "",
+		"billed_at":      session.BilledAt,
+		"charger_id":     session.ChargerID,
+		"connector_id":   session.ConnectorID,
 	}
-
-	h.hub.Publish(sessionID, gin.H{
-		"status":       "charging",
-		"charger_name": cpID,
-		"energy_kwh":   0,
-		"cost":         0,
-	})
-}
-
-func (h *ChargingHandler) onMeterValues(cpID string, connectorID int, transactionID int, energyKwh float64) {
-	session, err := h.chargingRepo.GetSessionByTransactionID(transactionID)
-	if err != nil || session == nil {
-		return
-	}
-
-	cost := roundToTwoCharging(energyKwh * costPerKwh)
-	_ = h.chargingRepo.UpdateSessionEnergyCost(session.ID, energyKwh, cost)
-
-	h.hub.Publish(session.ID, gin.H{
-		"status":       session.Status,
-		"charger_name": cpID,
-		"energy_kwh":   energyKwh,
-		"cost":         cost,
-	})
-}
-
-func (h *ChargingHandler) onStopTransaction(cpID string, transactionID int, meterStopKwh float64) {
-	session, err := h.chargingRepo.GetSessionByTransactionID(transactionID)
-	if err != nil || session == nil {
-		return
-	}
-
-	energy := meterStopKwh
-	if energy <= 0 {
-		energy = session.EnergyKwh
-	}
-
-	cost := roundToTwoCharging(energy * costPerKwh)
-	_ = h.chargingRepo.StopSession(session.ID, energy, cost)
-	_ = h.walletRepo.DebitWalletForSession(session.UserID, cost, session.ID)
-
-	h.hub.Publish(session.ID, gin.H{
-		"status":       "stopped",
-		"charger_name": cpID,
-		"energy_kwh":   energy,
-		"cost":         cost,
-	})
-}
-
-func roundToTwoCharging(val float64) float64 {
-	return math.Round(val*100) / 100
 }
 
 func verifyOCPPWebhookSignature(payload []byte, signature string, secret string) bool {
 	signature = strings.TrimSpace(signature)
 	signature = strings.TrimPrefix(signature, "sha256=")
 
-	expectedMAC := hmac.New(sha256.New, []byte(secret))
-	expectedMAC.Write(payload)
-	expected := expectedMAC.Sum(nil)
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(payload)
+	expected := mac.Sum(nil)
 
-	decodedSig, err := hex.DecodeString(signature)
+	decoded, err := hex.DecodeString(signature)
 	if err != nil {
 		return false
 	}
-	return hmac.Equal(decodedSig, expected)
+	return hmac.Equal(decoded, expected)
+}
+
+func fmtSscanf(raw string, out *int) (int, error) {
+	var v int
+	n, err := fmt.Sscanf(raw, "%d", &v)
+	if err == nil {
+		*out = v
+	}
+	return n, err
+}
+
+func startConflictCode(err error) string {
+	switch err {
+	case repositories.ErrChargerOffline:
+		return "charger_offline"
+	case repositories.ErrConnectorUnavailable:
+		return "connector_unavailable"
+	case repositories.ErrActiveSessionExists:
+		return "active_session_exists"
+	case repositories.ErrConnectorBusy:
+		return "connector_busy"
+	default:
+		return "charging_conflict"
+	}
 }
