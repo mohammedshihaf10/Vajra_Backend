@@ -11,8 +11,11 @@ type ChargingSession struct {
 	Cost                float64 `db:"cost" json:"cost"`
 	Status              string  `db:"status" json:"status"`
 	LegacyTransactionID int     `db:"transaction_id" json:"legacy_transaction_id"`
-	TransactionRef      string  `db:"transaction_ref" json:"transaction_id"`
+	TransactionRef      string  `db:"transaction_ref" json:"transaction_ref"`
+	OCPPTransactionID   string  `db:"ocpp_transaction_id" json:"transaction_id"`
 	RemoteStartID       string  `db:"remote_start_id" json:"remote_start_id"`
+	ChargingState       string  `db:"charging_state" json:"charging_state"`
+	IsActive            bool    `db:"is_active" json:"is_active"`
 	FailureReason       string  `db:"failure_reason" json:"failure_reason"`
 	StopRequestedAt     string  `db:"stop_requested_at" json:"stop_requested_at"`
 	BilledAt            string  `db:"billed_at" json:"billed_at"`

@@ -67,7 +67,9 @@ func RegisterRoutes(r *gin.Engine, db *sqlx.DB) {
 	chargingService := charging.NewService(db, client, statusClient, slog.Default(), charging.ServiceConfig{
 		IDTokenType:      firstNonEmptyEnv("CITRINE_ID_TOKEN_TYPE"),
 		CallbackURL:      callbackURL,
-		StartTimeout:     readDurationEnv("CHARGING_START_TIMEOUT", 2*time.Minute),
+		StartTimeout:     readDurationEnv("CHARGING_START_TIMEOUT", 5*time.Minute),
+		SyncTimeout:      readDurationEnv("CHARGING_STATUS_SYNC_TIMEOUT", 5*time.Minute),
+		SyncInterval:     readDurationEnv("CHARGING_STATUS_SYNC_INTERVAL", 5*time.Second),
 		RetryMaxAttempts: readIntEnv("CHARGING_RETRY_MAX_ATTEMPTS", 5),
 		RetryBaseDelay:   readDurationEnv("CHARGING_RETRY_BASE_DELAY", time.Second),
 	})

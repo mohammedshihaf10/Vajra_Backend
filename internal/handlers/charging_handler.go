@@ -241,6 +241,7 @@ func (h *ChargingHandler) StartCharging(c *gin.Context) {
 	}
 
 	h.hub.Publish(session.ID, sessionUpdatePayload(session))
+	h.service.SyncSessionFromActiveTransaction(c.Request.Context(), session.ID, h.hub)
 	c.JSON(http.StatusAccepted, StartChargingResponse{SessionID: session.ID, Status: session.Status})
 }
 
@@ -424,16 +425,19 @@ func (h *ChargingHandler) runRecoveryLoop() {
 
 func sessionUpdatePayload(session *models.ChargingSession) map[string]any {
 	return map[string]any{
-		"session_id":     session.ID,
-		"status":         session.Status,
-		"energy_kwh":     session.EnergyKwh,
-		"cost":           session.Cost,
-		"transaction_id": session.TransactionRef,
-		"failure_reason": session.FailureReason,
-		"stop_requested": session.StopRequestedAt != "",
-		"billed_at":      session.BilledAt,
-		"charger_id":     session.ChargerID,
-		"connector_id":   session.ConnectorID,
+		"session_id":      session.ID,
+		"status":          session.Status,
+		"energy_kwh":      session.EnergyKwh,
+		"cost":            session.Cost,
+		"transaction_ref": session.TransactionRef,
+		"transaction_id":  session.OCPPTransactionID,
+		"charging_state":  session.ChargingState,
+		"is_active":       session.IsActive,
+		"failure_reason":  session.FailureReason,
+		"stop_requested":  session.StopRequestedAt != "",
+		"billed_at":       session.BilledAt,
+		"charger_id":      session.ChargerID,
+		"connector_id":    session.ConnectorID,
 	}
 }
 

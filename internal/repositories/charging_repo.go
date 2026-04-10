@@ -33,16 +33,36 @@ func NewChargingRepository(db *sqlx.DB) *ChargingRepository {
 }
 
 func (r *ChargingRepository) CreateSession(session *models.ChargingSession) error {
-	query := `
-		INSERT INTO charging_sessions (charger_id, connector_id, user_id, status, remote_start_id)
+	tx, err := r.db.Beginx()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	insertQuery := `
+		INSERT INTO charging_sessions (charger_id, connector_id, user_id, status, is_active)
 		VALUES ($1, $2, $3, $4, $5)
 		RETURNING id,
 		          start_time::text,
-		          status,
-		          COALESCE(remote_start_id::text, '')
+		          status
 	`
-	return r.db.QueryRowx(query, session.ChargerID, session.ConnectorID, session.UserID, session.Status, nullIfEmpty(session.RemoteStartID)).
-		Scan(&session.ID, &session.StartTime, &session.Status, &session.RemoteStartID)
+	if err := tx.QueryRowx(insertQuery, session.ChargerID, session.ConnectorID, session.UserID, session.Status, false).
+		Scan(&session.ID, &session.StartTime, &session.Status); err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+func (r *ChargingRepository) UpdateRemoteStartID(sessionID string, remoteStartID string) error {
+	_, err := r.db.Exec(`
+		UPDATE charging_sessions
+		SET remote_start_id = $2
+		WHERE id = $1
+	`, sessionID, nullIfEmpty(remoteStartID))
+	return err
 }
 
 func (r *ChargingRepository) GetSessionByID(id string) (*models.ChargingSession, error) {
@@ -56,7 +76,7 @@ func (r *ChargingRepository) GetSessionByID(id string) (*models.ChargingSession,
 
 func (r *ChargingRepository) GetSessionByTransactionID(transactionRef string) (*models.ChargingSession, error) {
 	session := models.ChargingSession{}
-	err := r.db.Get(&session, sessionSelectQuery(`WHERE transaction_ref = $1 ORDER BY start_time DESC LIMIT 1`), transactionRef)
+	err := r.db.Get(&session, sessionSelectQuery(`WHERE transaction_ref = $1 OR ocpp_transaction_id = $1 ORDER BY start_time DESC LIMIT 1`), transactionRef)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -65,7 +85,7 @@ func (r *ChargingRepository) GetSessionByTransactionID(transactionRef string) (*
 
 func (r *ChargingRepository) GetSessionByTransactionIDTx(tx *sqlx.Tx, transactionRef string) (*models.ChargingSession, error) {
 	session := models.ChargingSession{}
-	err := tx.Get(&session, sessionSelectQuery(`WHERE transaction_ref = $1 ORDER BY start_time DESC LIMIT 1`), transactionRef)
+	err := tx.Get(&session, sessionSelectQuery(`WHERE transaction_ref = $1 OR ocpp_transaction_id = $1 ORDER BY start_time DESC LIMIT 1`), transactionRef)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -163,73 +183,101 @@ func (r *ChargingRepository) UpdateSessionStopping(id string) error {
 }
 
 func (r *ChargingRepository) AttachTransactionTx(tx *sqlx.Tx, chargerID string, connectorID int, transactionRef string, meterStartKwh float64, costPerKwh float64) (*models.ChargingSession, error) {
+	return r.AttachTransactionToSessionTx(tx, "", chargerID, connectorID, transactionRef, transactionRef, meterStartKwh, "Charging", true, costPerKwh)
+}
+
+func (r *ChargingRepository) AttachTransactionToSessionTx(tx *sqlx.Tx, sessionID string, chargerID string, connectorID int, transactionRef string, ocppTransactionID string, energyKwh float64, chargingState string, isActive bool, costPerKwh float64) (*models.ChargingSession, error) {
 	session := models.ChargingSession{}
 	query := `
 		WITH target AS (
-			SELECT id, status
+			SELECT id, status, transaction_ref
 			FROM charging_sessions
 			WHERE charger_id = $1
 			  AND connector_id = $2
 			  AND status IN ('starting', 'stopping')
+			  AND ($3 = '' OR id = $3::uuid)
 			ORDER BY start_time DESC
 			LIMIT 1
 			FOR UPDATE
 		)
 		UPDATE charging_sessions cs
-		SET transaction_ref = $3,
-		    energy_kwh = $4,
-		    cost = $5,
-		    status = CASE WHEN target.status = 'stopping' THEN 'stopping' ELSE 'charging' END
+		SET transaction_ref = CASE
+		        WHEN COALESCE(target.transaction_ref, '') = '' THEN $4
+		        ELSE cs.transaction_ref
+		    END,
+		    ocpp_transaction_id = CASE
+		        WHEN COALESCE(target.transaction_ref, '') = '' THEN NULLIF($5, '')
+		        ELSE cs.ocpp_transaction_id
+		    END,
+		    energy_kwh = $6,
+		    cost = $7,
+		    charging_state = NULLIF($8, ''),
+		    is_active = $9,
+		    status = CASE
+		        WHEN target.status = 'stopping' THEN 'stopping'
+		        WHEN COALESCE(target.transaction_ref, '') = '' OR target.transaction_ref = $4 THEN 'charging'
+		        ELSE cs.status
+		    END
 		FROM target
 		WHERE cs.id = target.id
+		  AND (COALESCE(target.transaction_ref, '') = '' OR target.transaction_ref = $4)
 		RETURNING cs.id,
 		          cs.charger_id,
 		          cs.connector_id,
 		          cs.user_id,
-		          cs.start_time::text,
-		          COALESCE(cs.end_time::text, ''),
+		          cs.start_time::text AS start_time,
+		          COALESCE(cs.end_time::text, '') AS end_time,
 		          cs.energy_kwh,
 		          cs.cost,
 		          cs.status,
-		          COALESCE(cs.transaction_id, 0),
-		          COALESCE(cs.transaction_ref, ''),
-		          COALESCE(cs.remote_start_id::text, ''),
-		          COALESCE(cs.failure_reason, ''),
-		          COALESCE(cs.stop_requested_at::text, ''),
-		          COALESCE(cs.billed_at::text, '')
+		          COALESCE(cs.transaction_id, 0) AS transaction_id,
+		          COALESCE(cs.transaction_ref, '') AS transaction_ref,
+		          COALESCE(cs.ocpp_transaction_id, '') AS ocpp_transaction_id,
+		          COALESCE(cs.remote_start_id::text, '') AS remote_start_id,
+		          COALESCE(cs.charging_state, '') AS charging_state,
+		          COALESCE(cs.is_active, false) AS is_active,
+		          COALESCE(cs.failure_reason, '') AS failure_reason,
+		          COALESCE(cs.stop_requested_at::text, '') AS stop_requested_at,
+		          COALESCE(cs.billed_at::text, '') AS billed_at
 	`
-	err := tx.Get(&session, query, chargerID, connectorID, transactionRef, meterStartKwh, roundToTwo(meterStartKwh*costPerKwh))
+	err := tx.Get(&session, query, chargerID, connectorID, sessionID, transactionRef, ocppTransactionID, energyKwh, roundToTwo(energyKwh*costPerKwh), chargingState, isActive)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	return &session, err
 }
 
-func (r *ChargingRepository) UpdateSessionMeterValuesTx(tx *sqlx.Tx, transactionRef string, energyKwh float64, costPerKwh float64) (*models.ChargingSession, error) {
+func (r *ChargingRepository) UpdateSessionMeterValuesTx(tx *sqlx.Tx, transactionRef string, energyKwh float64, chargingState string, isActive bool, costPerKwh float64) (*models.ChargingSession, error) {
 	session := models.ChargingSession{}
 	query := `
 		UPDATE charging_sessions
 		SET energy_kwh = $2,
 		    cost = $3,
+		    charging_state = NULLIF($4, ''),
+		    is_active = $5,
 		    status = CASE WHEN status = 'starting' THEN 'charging' ELSE status END
 		WHERE transaction_ref = $1
+		   OR ocpp_transaction_id = $1
 		RETURNING id,
 		          charger_id,
 		          connector_id,
 		          user_id,
-		          start_time::text,
-		          COALESCE(end_time::text, ''),
+		          start_time::text AS start_time,
+		          COALESCE(end_time::text, '') AS end_time,
 		          energy_kwh,
 		          cost,
 		          status,
-		          COALESCE(transaction_id, 0),
-		          COALESCE(transaction_ref, ''),
-		          COALESCE(remote_start_id::text, ''),
-		          COALESCE(failure_reason, ''),
-		          COALESCE(stop_requested_at::text, ''),
-		          COALESCE(billed_at::text, '')
+		          COALESCE(transaction_id, 0) AS transaction_id,
+		          COALESCE(transaction_ref, '') AS transaction_ref,
+		          COALESCE(ocpp_transaction_id, '') AS ocpp_transaction_id,
+		          COALESCE(remote_start_id::text, '') AS remote_start_id,
+		          COALESCE(charging_state, '') AS charging_state,
+		          COALESCE(is_active, false) AS is_active,
+		          COALESCE(failure_reason, '') AS failure_reason,
+		          COALESCE(stop_requested_at::text, '') AS stop_requested_at,
+		          COALESCE(billed_at::text, '') AS billed_at
 	`
-	err := tx.Get(&session, query, transactionRef, energyKwh, roundToTwo(energyKwh*costPerKwh))
+	err := tx.Get(&session, query, transactionRef, energyKwh, roundToTwo(energyKwh*costPerKwh), chargingState, isActive)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -379,7 +427,10 @@ func sessionSelectQuery(whereClause string) string {
 		       status,
 		       COALESCE(transaction_id, 0) AS transaction_id,
 		       COALESCE(transaction_ref, '') AS transaction_ref,
+		       COALESCE(ocpp_transaction_id, '') AS ocpp_transaction_id,
 		       COALESCE(remote_start_id::text, '') AS remote_start_id,
+		       COALESCE(charging_state, '') AS charging_state,
+		       COALESCE(is_active, false) AS is_active,
 		       COALESCE(failure_reason, '') AS failure_reason,
 		       COALESCE(stop_requested_at::text, '') AS stop_requested_at,
 		       COALESCE(billed_at::text, '') AS billed_at

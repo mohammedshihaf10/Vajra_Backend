@@ -41,12 +41,13 @@ type StartTransactionRequest struct {
 	Identifier      string         `json:"-"`
 	IDTag           string         `json:"idTag"`
 	ConnectorID     *int           `json:"connectorId,omitempty"`
+	RemoteStartID   string         `json:"remoteStartId,omitempty"`
 	ChargingProfile map[string]any `json:"chargingProfile,omitempty"`
 }
 
 type StopTransactionRequest struct {
 	Identifier    string `json:"-"`
-	TransactionID string `json:"transactionId"`
+	TransactionID int    `json:"transactionId"`
 }
 
 type UnlockConnectorRequest struct {
@@ -164,7 +165,7 @@ func (c *HTTPCitrineClient) StopTransaction(ctx context.Context, req StopTransac
 	if c.callbackURL != "" {
 		query.Set("callbackUrl", c.callbackURL)
 	}
-	return c.dispatchCommand(ctx, http.MethodPost, "/ocpp/1.6/evdriver/requestStopTransaction", query, req)
+	return c.dispatchCommand(ctx, http.MethodPost, "/ocpp/1.6/evdriver/remoteStopTransaction", query, req)
 }
 
 func (c *HTTPCitrineClient) UnlockConnector(ctx context.Context, req UnlockConnectorRequest) error {

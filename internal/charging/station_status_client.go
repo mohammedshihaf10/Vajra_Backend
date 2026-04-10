@@ -66,8 +66,109 @@ const stationStatusQuery = `query GetChargingStationById($id: String!) {
   }
 }`
 
+const transactionByRemoteStartIDQuery = `query GetTransactionByRemoteStartId($remoteStartId: Int!) {
+  Transactions(
+    where: {remoteStartId: {_eq: $remoteStartId}}
+    order_by: {createdAt: asc}
+    limit: 2
+  ) {
+    id
+    stationId
+    transactionId
+    remoteStartId
+    isActive
+    chargingState
+    totalKwh
+    evseId
+    createdAt
+    updatedAt
+    Connector {
+      connectorId
+    }
+  }
+}`
+
+const transactionFallbackQuery = `query GetTransactionFallback($stationId: String!, $createdAt: timestamptz!, $connectorId: Int) {
+  Transactions(
+    where: {
+      stationId: {_eq: $stationId},
+      createdAt: {_gte: $createdAt},
+      _or: [
+        {Connector: {connectorId: {_eq: $connectorId}}},
+        {Connector: {connectorId: {_is_null: true}}}
+      ]
+    }
+    order_by: {createdAt: asc}
+    limit: 2
+  ) {
+    id
+    stationId
+    transactionId
+    remoteStartId
+    isActive
+    chargingState
+    totalKwh
+    evseId
+    createdAt
+    updatedAt
+    Connector {
+      connectorId
+    }
+  }
+}`
+
+const transactionByIDQuery = `query GetTransactionById($id: Int!) {
+  Transactions_by_pk(id: $id) {
+    id
+    timeSpentCharging
+    isActive
+    chargingState
+    stationId
+    stoppedReason
+    transactionId
+    evseId
+    remoteStartId
+    totalKwh
+    createdAt
+    updatedAt
+    Connector {
+      connectorId
+    }
+  }
+}`
+
 type StationStatusClient interface {
 	GetConnectorStatus(ctx context.Context, chargerID string, connectorID int) (*models.ConnectorStatus, error)
+	GetTransactionByRemoteStartID(ctx context.Context, remoteStartID int) (*ActiveTransaction, error)
+	FindFallbackTransactions(ctx context.Context, chargerID string, connectorID int, createdAt string) ([]ActiveTransaction, error)
+	GetTransactionByID(ctx context.Context, id int) (*ChargingTransaction, error)
+}
+
+type ActiveTransaction struct {
+	ID            int
+	StationID     string
+	TransactionID string
+	ConnectorID   int
+	RemoteStartID int
+	CreatedAt     string
+	IsActive      bool
+	ChargingState string
+}
+
+type ChargingTransaction struct {
+	ID                int
+	TimeSpentCharging int
+	IsActive          bool
+	ChargingState     string
+	StationID         string
+	StoppedReason     string
+	TransactionID     string
+	EVSEID            *int
+	RemoteStartID     int
+	TotalKwh          float64
+	CreatedAt         string
+	UpdatedAt         string
+	ConnectorID       int
 }
 
 type HasuraStationStatusClient struct {
@@ -92,7 +193,9 @@ type graphqlResponse struct {
 }
 
 type stationStatusData struct {
-	ChargingStation *chargingStation `json:"ChargingStations_by_pk"`
+	ChargingStation *chargingStation    `json:"ChargingStations_by_pk"`
+	Transactions    []graphqlTxSummary  `json:"Transactions"`
+	TransactionByPK *graphqlTransaction `json:"Transactions_by_pk"`
 }
 
 type chargingStation struct {
@@ -103,6 +206,41 @@ type chargingStation struct {
 	ChargePointModel          string                     `json:"chargePointModel"`
 	Connectors                []graphqlConnector         `json:"Connectors"`
 	LatestStatusNotifications []latestStatusNotification `json:"LatestStatusNotifications"`
+	Transactions              []graphqlTransaction       `json:"Transactions"`
+}
+
+type graphqlTransaction struct {
+	ID                int     `json:"id"`
+	TimeSpentCharging int     `json:"timeSpentCharging"`
+	IsActive          bool    `json:"isActive"`
+	ChargingState     string  `json:"chargingState"`
+	StationID         string  `json:"stationId"`
+	StoppedReason     string  `json:"stoppedReason"`
+	TransactionID     string  `json:"transactionId"`
+	EVSEID            *int    `json:"evseId"`
+	RemoteStartID     int     `json:"remoteStartId"`
+	TotalKwh          float64 `json:"totalKwh"`
+	CreatedAt         string  `json:"createdAt"`
+	UpdatedAt         string  `json:"updatedAt"`
+	Connector         struct {
+		ConnectorID int `json:"connectorId"`
+	} `json:"Connector"`
+}
+
+type graphqlTxSummary struct {
+	ID            int     `json:"id"`
+	StationID     string  `json:"stationId"`
+	TransactionID string  `json:"transactionId"`
+	RemoteStartID int     `json:"remoteStartId"`
+	IsActive      bool    `json:"isActive"`
+	ChargingState string  `json:"chargingState"`
+	TotalKwh      float64 `json:"totalKwh"`
+	EVSEID        *int    `json:"evseId"`
+	CreatedAt     string  `json:"createdAt"`
+	UpdatedAt     string  `json:"updatedAt"`
+	Connector     struct {
+		ConnectorID int `json:"connectorId"`
+	} `json:"Connector"`
 }
 
 type graphqlConnector struct {
@@ -141,11 +279,127 @@ func (c *HasuraStationStatusClient) GetConnectorStatus(ctx context.Context, char
 		return nil, nil
 	}
 
-	reqBody := graphqlRequest{
+	var parsed graphqlResponse
+	body, err := c.doGraphQL(ctx, graphqlRequest{
 		Query:         stationStatusQuery,
 		Variables:     map[string]any{"id": chargerID},
 		OperationName: "GetChargingStationById",
+	}, &parsed)
+	if err != nil {
+		return nil, err
 	}
+	if parsed.Data.ChargingStation == nil {
+		return nil, nil
+	}
+
+	log.Printf("HASURA RESPONSE charger=%s connector=%d body=%s", chargerID, connectorID, truncateLogBody(string(body), 8000))
+	status := c.pickConnectorStatus(parsed.Data.ChargingStation, chargerID, connectorID)
+	if status != nil {
+		c.logger.Info("resolved connector status from graphql",
+			"charger_id", chargerID,
+			"connector_id", connectorID,
+			"status", status.Status,
+		)
+	}
+	return status, nil
+}
+
+func (c *HasuraStationStatusClient) GetTransactionByRemoteStartID(ctx context.Context, remoteStartID int) (*ActiveTransaction, error) {
+	if c.url == "" || remoteStartID <= 0 {
+		return nil, nil
+	}
+
+	var parsed graphqlResponse
+	body, err := c.doGraphQL(ctx, graphqlRequest{
+		Query:         transactionByRemoteStartIDQuery,
+		Variables:     map[string]any{"remoteStartId": remoteStartID},
+		OperationName: "GetTransactionByRemoteStartId",
+	}, &parsed)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Printf("HASURA TRANSACTION BY REMOTE START remote_start_id=%d body=%s", remoteStartID, truncateLogBody(string(body), 8000))
+	if len(parsed.Data.Transactions) == 0 {
+		return nil, nil
+	}
+	if len(parsed.Data.Transactions) > 1 {
+		return nil, fmt.Errorf("multiple transactions matched remoteStartId=%d", remoteStartID)
+	}
+	return toActiveTransaction(parsed.Data.Transactions[0]), nil
+}
+
+func (c *HasuraStationStatusClient) FindFallbackTransactions(ctx context.Context, chargerID string, connectorID int, createdAt string) ([]ActiveTransaction, error) {
+	if c.url == "" || strings.TrimSpace(chargerID) == "" || strings.TrimSpace(createdAt) == "" {
+		return nil, nil
+	}
+
+	var parsed graphqlResponse
+	body, err := c.doGraphQL(ctx, graphqlRequest{
+		Query: transactionFallbackQuery,
+		Variables: map[string]any{
+			"stationId":   chargerID,
+			"createdAt":   createdAt,
+			"connectorId": connectorID,
+		},
+		OperationName: "GetTransactionFallback",
+	}, &parsed)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Printf("HASURA TRANSACTION FALLBACK charger=%s connector=%d created_at=%s body=%s", chargerID, connectorID, createdAt, truncateLogBody(string(body), 8000))
+	result := make([]ActiveTransaction, 0, len(parsed.Data.Transactions))
+	for _, tx := range parsed.Data.Transactions {
+		if tx.ID <= 0 {
+			continue
+		}
+		if connectorID > 0 && tx.Connector.ConnectorID > 0 && tx.Connector.ConnectorID != connectorID {
+			continue
+		}
+		result = append(result, *toActiveTransaction(tx))
+	}
+	return result, nil
+}
+
+func (c *HasuraStationStatusClient) GetTransactionByID(ctx context.Context, id int) (*ChargingTransaction, error) {
+	if c.url == "" || id <= 0 {
+		return nil, nil
+	}
+
+	var parsed graphqlResponse
+	body, err := c.doGraphQL(ctx, graphqlRequest{
+		Query:         transactionByIDQuery,
+		Variables:     map[string]any{"id": id},
+		OperationName: "GetTransactionById",
+	}, &parsed)
+	if err != nil {
+		return nil, err
+	}
+	if parsed.Data.TransactionByPK == nil {
+		return nil, nil
+	}
+
+	log.Printf("HASURA TRANSACTION BY ID id=%d body=%s", id, truncateLogBody(string(body), 8000))
+	tx := parsed.Data.TransactionByPK
+	return &ChargingTransaction{
+		ID:                tx.ID,
+		TimeSpentCharging: tx.TimeSpentCharging,
+		IsActive:          tx.IsActive,
+		ChargingState:     strings.TrimSpace(tx.ChargingState),
+		StationID:         strings.TrimSpace(tx.StationID),
+		StoppedReason:     strings.TrimSpace(tx.StoppedReason),
+		TransactionID:     strings.TrimSpace(tx.TransactionID),
+		EVSEID:            tx.EVSEID,
+		RemoteStartID:     tx.RemoteStartID,
+		TotalKwh:          tx.TotalKwh,
+		CreatedAt:         tx.CreatedAt,
+		UpdatedAt:         tx.UpdatedAt,
+		ConnectorID:       tx.Connector.ConnectorID,
+	}, nil
+}
+
+func (c *HasuraStationStatusClient) doGraphQL(ctx context.Context, reqBody graphqlRequest, out any) ([]byte, error) {
 	payload, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, err
@@ -174,31 +428,17 @@ func (c *HasuraStationStatusClient) GetConnectorStatus(ctx context.Context, char
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("HASURA RESPONSE charger=%s connector=%d status=%d body=%s", chargerID, connectorID, resp.StatusCode, truncateLogBody(string(body), 8000))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("hasura status request failed: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return body, fmt.Errorf("hasura status request failed: %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	if err := json.Unmarshal(body, out); err != nil {
+		return body, err
 	}
 
-	var parsed graphqlResponse
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return nil, err
+	if parsed, ok := out.(*graphqlResponse); ok && len(parsed.Errors) > 0 {
+		return body, fmt.Errorf("hasura graphql error: %s", parsed.Errors[0].Message)
 	}
-	if len(parsed.Errors) > 0 {
-		return nil, fmt.Errorf("hasura graphql error: %s", parsed.Errors[0].Message)
-	}
-	if parsed.Data.ChargingStation == nil {
-		return nil, nil
-	}
-
-	status := c.pickConnectorStatus(parsed.Data.ChargingStation, chargerID, connectorID)
-	if status != nil {
-		c.logger.Info("resolved connector status from graphql",
-			"charger_id", chargerID,
-			"connector_id", connectorID,
-			"status", status.Status,
-		)
-	}
-	return status, nil
+	return body, nil
 }
 
 func (c *HasuraStationStatusClient) pickConnectorStatus(station *chargingStation, chargerID string, connectorID int) *models.ConnectorStatus {
@@ -255,4 +495,17 @@ func truncateLogBody(body string, limit int) string {
 		return body
 	}
 	return body[:limit] + "...(truncated)"
+}
+
+func toActiveTransaction(tx graphqlTxSummary) *ActiveTransaction {
+	return &ActiveTransaction{
+		ID:            tx.ID,
+		StationID:     strings.TrimSpace(tx.StationID),
+		TransactionID: strings.TrimSpace(tx.TransactionID),
+		ConnectorID:   tx.Connector.ConnectorID,
+		RemoteStartID: tx.RemoteStartID,
+		CreatedAt:     tx.CreatedAt,
+		IsActive:      tx.IsActive,
+		ChargingState: strings.TrimSpace(tx.ChargingState),
+	}
 }
