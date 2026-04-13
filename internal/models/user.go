@@ -5,6 +5,7 @@ type User struct {
 	FullName           string `db:"full_name" json:"full_name"`
 	Email              string `db:"email" json:"email"`
 	PhoneNumber        string `db:"phone_number" json:"phone_number"`
+	IDTag              string `db:"id_tag" json:"id_tag"`
 	AuthProvider       string `db:"auth_provider" json:"auth_provider"`
 	IsEmailVerified    bool   `db:"is_email_verified" json:"is_email_verified"`
 	IsPhoneVerified    bool   `db:"is_phone_verified" json:"is_phone_verified"`

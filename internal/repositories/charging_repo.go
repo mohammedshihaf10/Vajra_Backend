@@ -74,6 +74,15 @@ func (r *ChargingRepository) GetSessionByID(id string) (*models.ChargingSession,
 	return &session, err
 }
 
+func (r *ChargingRepository) GetSessionByIDTx(tx *sqlx.Tx, id string) (*models.ChargingSession, error) {
+	session := models.ChargingSession{}
+	err := tx.Get(&session, sessionSelectQuery(`WHERE id = $1`), id)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &session, err
+}
+
 func (r *ChargingRepository) GetSessionByTransactionID(transactionRef string) (*models.ChargingSession, error) {
 	session := models.ChargingSession{}
 	err := r.db.Get(&session, sessionSelectQuery(`WHERE transaction_ref = $1 OR ocpp_transaction_id = $1 ORDER BY start_time DESC LIMIT 1`), transactionRef)
@@ -86,6 +95,32 @@ func (r *ChargingRepository) GetSessionByTransactionID(transactionRef string) (*
 func (r *ChargingRepository) GetSessionByTransactionIDTx(tx *sqlx.Tx, transactionRef string) (*models.ChargingSession, error) {
 	session := models.ChargingSession{}
 	err := tx.Get(&session, sessionSelectQuery(`WHERE transaction_ref = $1 OR ocpp_transaction_id = $1 ORDER BY start_time DESC LIMIT 1`), transactionRef)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &session, err
+}
+
+func (r *ChargingRepository) GetLatestSessionByChargerConnectorTx(tx *sqlx.Tx, chargerID string, connectorID int, statuses []string) (*models.ChargingSession, error) {
+	if len(statuses) == 0 {
+		return nil, nil
+	}
+
+	placeholders := make([]string, 0, len(statuses))
+	args := make([]any, 0, len(statuses)+2)
+	args = append(args, chargerID, connectorID)
+	for i, status := range statuses {
+		placeholders = append(placeholders, fmt.Sprintf("$%d", i+3))
+		args = append(args, status)
+	}
+
+	query := sessionSelectQuery(fmt.Sprintf(
+		`WHERE charger_id = $1 AND connector_id = $2 AND status IN (%s) ORDER BY start_time DESC LIMIT 1`,
+		strings.Join(placeholders, ", "),
+	))
+
+	session := models.ChargingSession{}
+	err := tx.Get(&session, query, args...)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -174,11 +209,45 @@ func (r *ChargingRepository) UpdateSessionStopping(id string) error {
 	query := `
 		UPDATE charging_sessions
 		SET status = 'stopping',
-		    stop_requested_at = NOW()
+		    stop_requested_at = NOW(),
+		    stop_poll_claimed_at = NULL
 		WHERE id = $1
 		  AND status IN ('starting', 'charging')
 	`
 	_, err := r.db.Exec(query, id)
+	return err
+}
+
+func (r *ChargingRepository) ClaimStopPolling(sessionID string, lease time.Duration) (bool, error) {
+	if lease <= 0 {
+		lease = time.Minute
+	}
+	result, err := r.db.Exec(`
+		UPDATE charging_sessions
+		SET stop_poll_claimed_at = NOW()
+		WHERE id = $1
+		  AND status = 'stopping'
+		  AND (
+			stop_poll_claimed_at IS NULL
+			OR stop_poll_claimed_at <= NOW() - ($2 * INTERVAL '1 second')
+		  )
+	`, sessionID, lease.Seconds())
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
+func (r *ChargingRepository) ReleaseStopPolling(sessionID string) error {
+	_, err := r.db.Exec(`
+		UPDATE charging_sessions
+		SET stop_poll_claimed_at = NULL
+		WHERE id = $1
+	`, sessionID)
 	return err
 }
 
@@ -284,7 +353,7 @@ func (r *ChargingRepository) UpdateSessionMeterValuesTx(tx *sqlx.Tx, transaction
 	return &session, err
 }
 
-func (r *ChargingRepository) FinalizeStoppedSessionTx(tx *sqlx.Tx, sessionID string, energyKwh float64, cost float64, billed bool, billErr error) error {
+func (r *ChargingRepository) FinalizeStoppedSessionTx(tx *sqlx.Tx, sessionID string, energyKwh float64, cost float64, billed bool, billErr error, chargingState string) error {
 	query := `
 		UPDATE charging_sessions
 		SET status = 'stopped',
@@ -292,14 +361,16 @@ func (r *ChargingRepository) FinalizeStoppedSessionTx(tx *sqlx.Tx, sessionID str
 		    energy_kwh = $2,
 		    cost = $3,
 		    billed_at = CASE WHEN $4 THEN NOW() ELSE billed_at END,
-		    failure_reason = CASE WHEN $5 <> '' THEN $5 ELSE failure_reason END
+		    failure_reason = CASE WHEN $5 <> '' THEN $5 ELSE failure_reason END,
+		    charging_state = COALESCE(NULLIF($6, ''), charging_state),
+		    is_active = false
 		WHERE id = $1
 	`
 	reason := ""
 	if billErr != nil {
 		reason = billErr.Error()
 	}
-	_, err := tx.Exec(query, sessionID, energyKwh, cost, billed, reason)
+	_, err := tx.Exec(query, sessionID, energyKwh, cost, billed, reason, chargingState)
 	return err
 }
 
@@ -433,6 +504,7 @@ func sessionSelectQuery(whereClause string) string {
 		       COALESCE(is_active, false) AS is_active,
 		       COALESCE(failure_reason, '') AS failure_reason,
 		       COALESCE(stop_requested_at::text, '') AS stop_requested_at,
+		       COALESCE(stop_poll_claimed_at::text, '') AS stop_poll_claimed_at,
 		       COALESCE(billed_at::text, '') AS billed_at
 		FROM charging_sessions
 	` + whereClause

@@ -278,6 +278,11 @@ func (h *ChargingHandler) StopCharging(c *gin.Context) {
 	}
 
 	h.hub.Publish(session.ID, sessionUpdatePayload(session))
+	if strings.TrimSpace(session.OCPPTransactionID) == "" {
+		h.service.SyncSessionFromActiveTransaction(c.Request.Context(), session.ID, h.hub)
+	} else {
+		h.service.StartRemoteStopPolling(session.ID, h.hub)
+	}
 	c.JSON(http.StatusAccepted, StopChargingResponse{
 		SessionID:     session.ID,
 		Status:        session.Status,
@@ -374,6 +379,11 @@ func (h *ChargingHandler) LiveUpdatesWS(c *gin.Context) {
 }
 
 func (h *ChargingHandler) OCPPWebhook(c *gin.Context) {
+	if !h.service.WebhookEventsEnabled() {
+		c.JSON(http.StatusAccepted, gin.H{"status": "ignored", "reason": "charging webhook processing disabled"})
+		return
+	}
+
 	payload, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})

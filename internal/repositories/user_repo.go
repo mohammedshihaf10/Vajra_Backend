@@ -32,9 +32,9 @@ func (r *UserRepository) Create(user *models.User) error {
 	}
 
 	query := `
-		INSERT INTO users (full_name, email, phone_number)
-		VALUES ($1, $2, $3)
-		RETURNING id, created_at, updated_at
+		INSERT INTO users (full_name, email, phone_number, id_tag)
+		VALUES ($1, $2, $3, NULLIF($4, ''))
+		RETURNING id, COALESCE(id_tag, '') AS id_tag, created_at, updated_at
 	`
 
 	err = tx.QueryRowx(
@@ -42,7 +42,8 @@ func (r *UserRepository) Create(user *models.User) error {
 		user.FullName,
 		emailValue,
 		user.PhoneNumber,
-	).Scan(&user.ID, &user.CreatedAt, &user.UpdatedAt)
+		user.IDTag,
+	).Scan(&user.ID, &user.IDTag, &user.CreatedAt, &user.UpdatedAt)
 	if err != nil {
 		_ = tx.Rollback()
 		return err
@@ -63,7 +64,7 @@ func (r *UserRepository) Create(user *models.User) error {
 
 func (r *UserRepository) GetByEmail(email string) (*models.User, error) {
 	user := models.User{}
-	query := `SELECT id, full_name, COALESCE(email, '') AS email, phone_number, auth_provider, is_email_verified, is_phone_verified, status, timezone, auth_token, auth_token_expires_at, created_at, updated_at FROM users WHERE email = $1`
+	query := `SELECT id, full_name, COALESCE(email, '') AS email, phone_number, COALESCE(id_tag, '') AS id_tag, auth_provider, is_email_verified, is_phone_verified, status, timezone, auth_token, auth_token_expires_at, created_at, updated_at FROM users WHERE email = $1`
 
 	err := r.db.Get(&user, query, email)
 	if err == sql.ErrNoRows {
@@ -80,6 +81,7 @@ func (r *UserRepository) GetByPhoneNumber(phoneNumber string) (*models.User, err
 		full_name,
 		COALESCE(email, '') AS email,
 		phone_number,
+		COALESCE(id_tag, '') AS id_tag,
 		auth_provider,
 		is_email_verified,
 		is_phone_verified,
@@ -102,7 +104,7 @@ func (r *UserRepository) GetByPhoneNumber(phoneNumber string) (*models.User, err
 
 func (r *UserRepository) GetByID(id string) (*models.User, error) {
 	user := models.User{}
-	query := `SELECT id, full_name, COALESCE(email, '') AS email, phone_number, auth_provider, is_email_verified, is_phone_verified, status, timezone, auth_token, auth_token_expires_at, created_at, updated_at FROM users WHERE id = $1`
+	query := `SELECT id, full_name, COALESCE(email, '') AS email, phone_number, COALESCE(id_tag, '') AS id_tag, auth_provider, is_email_verified, is_phone_verified, status, timezone, auth_token, auth_token_expires_at, created_at, updated_at FROM users WHERE id = $1`
 
 	err := r.db.Get(&user, query, id)
 	if err == sql.ErrNoRows {
@@ -124,7 +126,7 @@ func (r *UserRepository) SetAuthToken(userID, token string, expiresAt time.Time)
 func (r *UserRepository) GetByAuthToken(token string) (*models.User, error) {
 	user := models.User{}
 	query := `
-		SELECT id, full_name, COALESCE(email, '') AS email, phone_number, auth_provider, is_email_verified, is_phone_verified, status, timezone, auth_token, auth_token_expires_at, created_at, updated_at
+		SELECT id, full_name, COALESCE(email, '') AS email, phone_number, COALESCE(id_tag, '') AS id_tag, auth_provider, is_email_verified, is_phone_verified, status, timezone, auth_token, auth_token_expires_at, created_at, updated_at
 		FROM users
 		WHERE auth_token = $1 AND auth_token_expires_at > NOW()
 	`
@@ -143,6 +145,17 @@ func (r *UserRepository) ClearAuthToken(userID string) error {
 		WHERE id = $1
 	`
 	_, err := r.db.Exec(query, userID)
+	return err
+}
+
+func (r *UserRepository) SetIDTag(userID, idTag string) error {
+	query := `
+		UPDATE users
+		SET id_tag = NULLIF($1, ''),
+		    updated_at = NOW()
+		WHERE id = $2
+	`
+	_, err := r.db.Exec(query, idTag, userID)
 	return err
 }
 

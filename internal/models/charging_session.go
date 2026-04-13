@@ -18,5 +18,6 @@ type ChargingSession struct {
 	IsActive            bool    `db:"is_active" json:"is_active"`
 	FailureReason       string  `db:"failure_reason" json:"failure_reason"`
 	StopRequestedAt     string  `db:"stop_requested_at" json:"stop_requested_at"`
+	StopPollClaimedAt   string  `db:"stop_poll_claimed_at" json:"stop_poll_claimed_at"`
 	BilledAt            string  `db:"billed_at" json:"billed_at"`
 }

@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -24,6 +25,7 @@ const (
 	DefaultCostPerKwh      = 24.90
 	MaxOCPPIDTagLength     = 20
 	MaxOCPPRemoteStartID   = 2147483647
+	remoteStopPollLease    = 30 * time.Second
 )
 
 type Publisher interface {
@@ -31,33 +33,45 @@ type Publisher interface {
 }
 
 type ServiceConfig struct {
-	IDTokenType      string
-	CallbackURL      string
-	StartTimeout     time.Duration
-	SyncTimeout      time.Duration
-	SyncInterval     time.Duration
-	RetryMaxAttempts int
-	RetryBaseDelay   time.Duration
-	CostPerKwh       float64
-	MinStartBalance  float64
+	IDTokenType            string
+	CallbackURL            string
+	UseWebhookEvents       bool
+	StartTimeout           time.Duration
+	SyncTimeout            time.Duration
+	SyncInterval           time.Duration
+	RetryMaxAttempts       int
+	RetryBaseDelay         time.Duration
+	CostPerKwh             float64
+	MinStartBalance        float64
+	RemoteStopInitialDelay time.Duration
+	RemoteStopPollInterval time.Duration
+	RemoteStopMaxAttempts  int
 }
 
 type Service struct {
 	db           *sqlx.DB
 	client       CitrineClient
 	statusClient StationStatusClient
+	authClient   AuthorizationClient
 	chargingRepo *repositories.ChargingRepository
+	userRepo     *repositories.UserRepository
 	walletRepo   *repositories.WalletRepository
 	logger       *slog.Logger
 	retryQueue   *RetryQueue
 	metrics      *Metrics
+	stopPollMu   sync.Mutex
+	stopPollers  map[string]struct{}
 
-	idTokenType     string
-	costPerKwh      float64
-	minStartBalance float64
-	startTimeout    time.Duration
-	syncTimeout     time.Duration
-	syncInterval    time.Duration
+	idTokenType            string
+	costPerKwh             float64
+	minStartBalance        float64
+	startTimeout           time.Duration
+	syncTimeout            time.Duration
+	syncInterval           time.Duration
+	useWebhookEvents       bool
+	remoteStopInitialDelay time.Duration
+	remoteStopPollInterval time.Duration
+	remoteStopMaxAttempts  int
 }
 
 type StartSessionInput struct {
@@ -120,7 +134,7 @@ type StopTransactionEvent struct {
 	MeterStopKwh  float64 `json:"meter_stop_kwh"`
 }
 
-func NewService(db *sqlx.DB, client CitrineClient, statusClient StationStatusClient, logger *slog.Logger, cfg ServiceConfig) *Service {
+func NewService(db *sqlx.DB, client CitrineClient, statusClient StationStatusClient, authClient AuthorizationClient, logger *slog.Logger, cfg ServiceConfig) *Service {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -148,27 +162,82 @@ func NewService(db *sqlx.DB, client CitrineClient, statusClient StationStatusCli
 	if cfg.MinStartBalance <= 0 {
 		cfg.MinStartBalance = DefaultMinStartBalance
 	}
+	if cfg.RemoteStopInitialDelay <= 0 {
+		cfg.RemoteStopInitialDelay = 2 * time.Second
+	}
+	if cfg.RemoteStopPollInterval <= 0 {
+		cfg.RemoteStopPollInterval = 2 * time.Second
+	}
+	if cfg.RemoteStopMaxAttempts <= 0 {
+		cfg.RemoteStopMaxAttempts = 20
+	}
 
 	return &Service{
-		db:              db,
-		client:          client,
-		statusClient:    statusClient,
-		chargingRepo:    repositories.NewChargingRepository(db),
-		walletRepo:      repositories.NewWalletRepository(db),
-		logger:          logger.With("component", "charging_service"),
-		retryQueue:      NewRetryQueue(logger, cfg.RetryMaxAttempts, cfg.RetryBaseDelay),
-		metrics:         NewMetrics(),
-		idTokenType:     cfg.IDTokenType,
-		costPerKwh:      cfg.CostPerKwh,
-		minStartBalance: cfg.MinStartBalance,
-		startTimeout:    cfg.StartTimeout,
-		syncTimeout:     cfg.SyncTimeout,
-		syncInterval:    cfg.SyncInterval,
+		db:                     db,
+		client:                 client,
+		statusClient:           statusClient,
+		authClient:             authClient,
+		chargingRepo:           repositories.NewChargingRepository(db),
+		userRepo:               repositories.NewUserRepository(db),
+		walletRepo:             repositories.NewWalletRepository(db),
+		logger:                 logger.With("component", "charging_service"),
+		retryQueue:             NewRetryQueue(logger, cfg.RetryMaxAttempts, cfg.RetryBaseDelay),
+		metrics:                NewMetrics(),
+		stopPollers:            make(map[string]struct{}),
+		idTokenType:            cfg.IDTokenType,
+		costPerKwh:             cfg.CostPerKwh,
+		minStartBalance:        cfg.MinStartBalance,
+		startTimeout:           cfg.StartTimeout,
+		syncTimeout:            cfg.SyncTimeout,
+		syncInterval:           cfg.SyncInterval,
+		useWebhookEvents:       cfg.UseWebhookEvents,
+		remoteStopInitialDelay: cfg.RemoteStopInitialDelay,
+		remoteStopPollInterval: cfg.RemoteStopPollInterval,
+		remoteStopMaxAttempts:  cfg.RemoteStopMaxAttempts,
 	}
 }
 
 func (s *Service) Metrics() MetricsSnapshot {
 	return s.metrics.Snapshot()
+}
+
+func (s *Service) WebhookEventsEnabled() bool {
+	return s.useWebhookEvents
+}
+
+func (s *Service) StartRemoteStopPolling(sessionID string, publisher Publisher) {
+	session, err := s.chargingRepo.GetSessionByID(sessionID)
+	if err != nil || session == nil {
+		return
+	}
+	if session.Status != StateStopping || strings.TrimSpace(session.OCPPTransactionID) == "" {
+		return
+	}
+
+	s.stopPollMu.Lock()
+	if _, exists := s.stopPollers[sessionID]; exists {
+		s.stopPollMu.Unlock()
+		return
+	}
+	s.stopPollers[sessionID] = struct{}{}
+	s.stopPollMu.Unlock()
+
+	claimed, err := s.chargingRepo.ClaimStopPolling(sessionID, remoteStopPollLease)
+	if err != nil {
+		s.stopPollMu.Lock()
+		delete(s.stopPollers, sessionID)
+		s.stopPollMu.Unlock()
+		s.logger.Warn("failed to claim remote stop poll lease", "session_id", sessionID, "error", err)
+		return
+	}
+	if !claimed {
+		s.stopPollMu.Lock()
+		delete(s.stopPollers, sessionID)
+		s.stopPollMu.Unlock()
+		return
+	}
+
+	go s.pollRemoteStopResult(sessionID, publisher)
 }
 
 func (s *Service) StartCharging(ctx context.Context, input StartSessionInput) (*models.ChargingSession, error) {
@@ -229,9 +298,30 @@ func (s *Service) StartCharging(ctx context.Context, input StartSessionInput) (*
 		return nil, err
 	}
 
+	user, err := s.userRepo.GetByID(input.UserID)
+	if err != nil {
+		return nil, err
+	}
+	if user == nil {
+		return nil, fmt.Errorf("user not found")
+	}
+
+	idTag := strings.TrimSpace(user.IDTag)
+	if idTag == "" {
+		idTag = makeOCPPIDTag(input.UserID)
+		if err := s.userRepo.SetIDTag(input.UserID, idTag); err != nil {
+			return nil, fmt.Errorf("persist idTag for user %q: %w", input.UserID, err)
+		}
+	}
+	if s.authClient != nil {
+		if err := s.authClient.EnsureAuthorization(ctx, idTag); err != nil {
+			return nil, fmt.Errorf("ensure authorization for idTag %q: %w", idTag, err)
+		}
+	}
+
 	startReq := StartTransactionRequest{
 		Identifier:    input.ChargerID,
-		IDTag:         "2",
+		IDTag:         idTag,
 		ConnectorID:   intPtr(input.ConnectorID),
 		RemoteStartID: session.RemoteStartID,
 	}
@@ -321,6 +411,111 @@ func (s *Service) StopCharging(ctx context.Context, input StopSessionInput) (*mo
 	return s.chargingRepo.GetSessionByID(session.ID)
 }
 
+func (s *Service) pollRemoteStopResult(sessionID string, publisher Publisher) {
+	defer func() {
+		if err := s.chargingRepo.ReleaseStopPolling(sessionID); err != nil {
+			s.logger.Warn("failed to release remote stop poll lease", "session_id", sessionID, "error", err)
+		}
+		s.stopPollMu.Lock()
+		delete(s.stopPollers, sessionID)
+		s.stopPollMu.Unlock()
+	}()
+
+	if s.statusClient == nil {
+		return
+	}
+
+	time.Sleep(s.remoteStopInitialDelay)
+
+	for attempt := 1; attempt <= s.remoteStopMaxAttempts; attempt++ {
+		session, err := s.chargingRepo.GetSessionByID(sessionID)
+		if err != nil {
+			s.logger.Warn("failed to reload session during remote stop polling", "session_id", sessionID, "attempt", attempt, "error", err)
+			return
+		}
+		if session == nil || session.Status != StateStopping {
+			return
+		}
+
+		txRecord, err := s.resolveTransactionForStopPolling(context.Background(), session)
+		if err != nil {
+			s.logger.Warn("failed to fetch transaction during remote stop polling", "session_id", sessionID, "attempt", attempt, "transaction_id", session.OCPPTransactionID, "transaction_ref", session.TransactionRef, "error", err)
+		} else if txRecord != nil {
+			s.logger.Info("remote stop polling transaction snapshot",
+				"session_id", sessionID,
+				"attempt", attempt,
+				"transaction_ref", session.TransactionRef,
+				"transaction_id", txRecord.TransactionID,
+				"source", txRecord.Source,
+				"is_active", txRecord.IsActive,
+				"charging_state", txRecord.ChargingState,
+				"total_kwh", txRecord.TotalKwh,
+				"updated_at", txRecord.UpdatedAt,
+			)
+		}
+		if err == nil && txRecord != nil && (!txRecord.IsActive || isTerminalChargingState(txRecord.ChargingState)) {
+			s.logger.Info("remote stop polling finalized transaction",
+				"session_id", sessionID,
+				"attempt", attempt,
+				"transaction_ref", session.TransactionRef,
+				"transaction_id", txRecord.TransactionID,
+				"source", txRecord.Source,
+				"is_active", txRecord.IsActive,
+				"charging_state", txRecord.ChargingState,
+				"total_kwh", txRecord.TotalKwh,
+				"updated_at", txRecord.UpdatedAt,
+			)
+			finalSession, err := s.finalizeStoppedSessionFromTransaction(context.Background(), session.ID, txRecord)
+			if err != nil {
+				s.logger.Warn("failed to finalize stopped session from polled transaction", "session_id", sessionID, "attempt", attempt, "transaction_id", session.OCPPTransactionID, "error", err)
+				return
+			}
+			if finalSession != nil && publisher != nil {
+				publisher.Publish(finalSession.ID, sessionPublishPayload(finalSession, finalSession.ChargingState, false, txRecord.UpdatedAt))
+			}
+			return
+		}
+
+		if attempt < s.remoteStopMaxAttempts {
+			time.Sleep(s.remoteStopPollInterval)
+		}
+	}
+
+	session, err := s.chargingRepo.GetSessionByID(sessionID)
+	if err != nil || session == nil || session.Status != StateStopping {
+		return
+	}
+	if err := s.chargingRepo.UpdateSessionState(session.ID, []string{StateStopping}, StateCharging, "Remote stop timeout"); err != nil {
+		s.logger.Warn("failed to revert session after remote stop timeout", "session_id", sessionID, "error", err)
+		return
+	}
+	session.Status = StateCharging
+	session.IsActive = true
+	session.FailureReason = "Remote stop timeout"
+	s.logger.Warn("remote stop timeout", "session_id", sessionID, "transaction_id", session.OCPPTransactionID)
+	if publisher != nil {
+		publisher.Publish(session.ID, sessionPublishPayload(session, session.ChargingState, session.IsActive, ""))
+	}
+}
+
+func (s *Service) resolveTransactionForStopPolling(ctx context.Context, session *models.ChargingSession) (*ChargingTransaction, error) {
+	if session == nil || s.statusClient == nil {
+		return nil, nil
+	}
+
+	if txID := parseInt(strings.TrimSpace(session.TransactionRef)); txID > 0 {
+		txRecord, err := s.statusClient.GetTransactionByID(ctx, txID)
+		if err == nil && txRecord != nil {
+			return txRecord, nil
+		}
+		if err != nil {
+			s.logger.Warn("failed to fetch transaction by hasura id during remote stop polling", "session_id", session.ID, "transaction_ref", session.TransactionRef, "error", err)
+		}
+	}
+
+	return s.statusClient.GetTransactionByOCPPTransactionID(ctx, session.OCPPTransactionID)
+}
+
 func (s *Service) RecoverStaleStarts(ctx context.Context, publisher Publisher) error {
 	sessionIDs, err := s.chargingRepo.FailStaleStartingSessions(s.startTimeout)
 	if err != nil {
@@ -338,6 +533,11 @@ func (s *Service) RecoverStaleStarts(ctx context.Context, publisher Publisher) e
 }
 
 func (s *Service) ProcessWebhook(ctx context.Context, rawPayload []byte, envelope WebhookEnvelope, publisher Publisher) error {
+	if !s.useWebhookEvents {
+		s.logger.Info("ignoring charging webhook because webhook flow is disabled", "event_type", envelope.EventType)
+		return nil
+	}
+
 	eventID := strings.TrimSpace(envelope.EventID)
 	if eventID == "" {
 		sum := sha256.Sum256(rawPayload)
@@ -454,14 +654,34 @@ func (s *Service) ProcessWebhook(ctx context.Context, rawPayload []byte, envelop
 		if err != nil {
 			return err
 		}
+		var txRecord *ChargingTransaction
+		if s.statusClient != nil {
+			txRecord, err = s.statusClient.GetTransactionByOCPPTransactionID(ctx, evt.TransactionID)
+			if err != nil {
+				s.logger.Warn("hasura transaction lookup failed for stop_transaction", "transaction_id", evt.TransactionID, "error", err)
+			}
+		}
+		if session == nil && txRecord != nil {
+			session, err = s.chargingRepo.GetLatestSessionByChargerConnectorTx(tx, txRecord.StationID, txRecord.ConnectorID, []string{StateStopping, StateCharging, StateStarting})
+			if err != nil {
+				return err
+			}
+		}
 		if session != nil {
 			energy := evt.MeterStopKwh
+			if txRecord != nil && txRecord.TotalKwh > 0 {
+				energy = txRecord.TotalKwh
+			}
 			if energy <= 0 {
 				energy = session.EnergyKwh
 			}
 			cost := roundCurrency(energy * s.costPerKwh)
 			billed, billErr := s.walletRepo.DebitWalletForSessionTx(tx, session.UserID, cost, session.ID)
-			if err := s.chargingRepo.FinalizeStoppedSessionTx(tx, session.ID, energy, cost, billed, billErr); err != nil {
+			finalChargingState := session.ChargingState
+			if txRecord != nil && strings.TrimSpace(txRecord.ChargingState) != "" {
+				finalChargingState = txRecord.ChargingState
+			}
+			if err := s.chargingRepo.FinalizeStoppedSessionTx(tx, session.ID, energy, cost, billed, billErr, finalChargingState); err != nil {
 				return err
 			}
 			publishSessionID = session.ID
@@ -469,6 +689,7 @@ func (s *Service) ProcessWebhook(ctx context.Context, rawPayload []byte, envelop
 			session.EnergyKwh = energy
 			session.Cost = cost
 			session.IsActive = false
+			session.ChargingState = finalChargingState
 			publishPayload = sessionPublishPayload(session, session.ChargingState, false, "")
 			startTime, endTime := parseSessionTimes(session.StartTime, time.Now().UTC().Format(time.RFC3339))
 			s.metrics.RecordChargingDuration(startTime, endTime)
@@ -557,6 +778,69 @@ func parseSessionTimes(startRaw, endRaw string) (time.Time, time.Time) {
 	return start, end
 }
 
+func (s *Service) finalizeStoppedSessionFromTransaction(ctx context.Context, sessionID string, txRecord *ChargingTransaction) (*models.ChargingSession, error) {
+	if txRecord == nil {
+		return nil, nil
+	}
+
+	dbtx, err := s.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = dbtx.Rollback()
+	}()
+
+	session, err := s.chargingRepo.GetSessionByIDTx(dbtx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if session == nil {
+		if err := dbtx.Commit(); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+	if session.Status == StateStopped {
+		if err := dbtx.Commit(); err != nil {
+			return nil, err
+		}
+		return session, nil
+	}
+	if session.Status != StateStopping {
+		if err := dbtx.Commit(); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+
+	energy := txRecord.TotalKwh
+	if energy <= 0 {
+		energy = session.EnergyKwh
+	}
+	cost := roundCurrency(energy * s.costPerKwh)
+	billed, billErr := s.walletRepo.DebitWalletForSessionTx(dbtx, session.UserID, cost, session.ID)
+	if err := s.chargingRepo.FinalizeStoppedSessionTx(dbtx, session.ID, energy, cost, billed, billErr, txRecord.ChargingState); err != nil {
+		return nil, err
+	}
+
+	if err := dbtx.Commit(); err != nil {
+		return nil, err
+	}
+
+	session.Status = StateStopped
+	session.EnergyKwh = energy
+	session.Cost = cost
+	session.IsActive = false
+	session.ChargingState = txRecord.ChargingState
+	startTime, endTime := parseSessionTimes(session.StartTime, time.Now().UTC().Format(time.RFC3339))
+	s.metrics.RecordChargingDuration(startTime, endTime)
+	if billErr != nil {
+		s.logger.Error("wallet debit deferred after polled stop finalization", "session_id", session.ID, "error", billErr)
+	}
+	return session, nil
+}
+
 func (s *Service) syncSessionFromActiveTransaction(sessionID string, chargerID string, connectorID int, publisher Publisher) {
 	if s.statusClient == nil {
 		return
@@ -627,6 +911,13 @@ func (s *Service) trySyncSessionFromActiveTransaction(ctx context.Context, sessi
 	if err != nil {
 		return false, err
 	}
+	if session.Status == StateStopping && nextSession != nil && strings.TrimSpace(nextSession.OCPPTransactionID) != "" && strings.TrimSpace(session.OCPPTransactionID) == "" {
+		stopReq := StopTransactionRequest{
+			Identifier:    nextSession.ChargerID,
+			TransactionID: parseInt(nextSession.OCPPTransactionID),
+		}
+		s.enqueueStopRetry(nextSession.ID, stopReq)
+	}
 	if nextSession != nil && publisher != nil {
 		publisher.Publish(nextSession.ID, sessionPublishPayload(nextSession, txRecord.ChargingState, txRecord.IsActive, txRecord.UpdatedAt))
 	}
@@ -644,7 +935,9 @@ func (s *Service) findTransactionForStartingSession(ctx context.Context, session
 		}
 	}
 	if session.Status != StateStarting {
-		return nil, nil
+		if session.Status != StateStopping {
+			return nil, nil
+		}
 	}
 
 	fallbackMatches, err := s.statusClient.FindFallbackTransactions(ctx, session.ChargerID, session.ConnectorID, session.StartTime)
@@ -719,7 +1012,7 @@ func (s *Service) applyTransactionSnapshot(ctx context.Context, session *models.
 	if !txRecord.IsActive || isTerminalChargingState(txRecord.ChargingState) {
 		cost := roundCurrency(txRecord.TotalKwh * s.costPerKwh)
 		billed, billErr := s.walletRepo.DebitWalletForSessionTx(dbtx, nextSession.UserID, cost, nextSession.ID)
-		if err := s.chargingRepo.FinalizeStoppedSessionTx(dbtx, nextSession.ID, txRecord.TotalKwh, cost, billed, billErr); err != nil {
+		if err := s.chargingRepo.FinalizeStoppedSessionTx(dbtx, nextSession.ID, txRecord.TotalKwh, cost, billed, billErr, txRecord.ChargingState); err != nil {
 			return nil, false, err
 		}
 		startTime, endTime := parseSessionTimes(nextSession.StartTime, time.Now().UTC().Format(time.RFC3339))
@@ -734,7 +1027,11 @@ func (s *Service) applyTransactionSnapshot(ctx context.Context, session *models.
 		nextSession.IsActive = false
 		nextSession.ChargingState = txRecord.ChargingState
 	} else {
-		nextSession.Status = StateCharging
+		if session.Status == StateStopping {
+			nextSession.Status = StateStopping
+		} else {
+			nextSession.Status = StateCharging
+		}
 		nextSession.EnergyKwh = txRecord.TotalKwh
 		nextSession.Cost = roundCurrency(txRecord.TotalKwh * s.costPerKwh)
 		nextSession.IsActive = txRecord.IsActive

@@ -64,14 +64,26 @@ func RegisterRoutes(r *gin.Engine, db *sqlx.DB) {
 		firstNonEmptyEnv("HASURA_GRAPHQL_BEARER_TOKEN"),
 		slog.Default(),
 	)
-	chargingService := charging.NewService(db, client, statusClient, slog.Default(), charging.ServiceConfig{
-		IDTokenType:      firstNonEmptyEnv("CITRINE_ID_TOKEN_TYPE"),
-		CallbackURL:      callbackURL,
-		StartTimeout:     readDurationEnv("CHARGING_START_TIMEOUT", 5*time.Minute),
-		SyncTimeout:      readDurationEnv("CHARGING_STATUS_SYNC_TIMEOUT", 5*time.Minute),
-		SyncInterval:     readDurationEnv("CHARGING_STATUS_SYNC_INTERVAL", 5*time.Second),
-		RetryMaxAttempts: readIntEnv("CHARGING_RETRY_MAX_ATTEMPTS", 5),
-		RetryBaseDelay:   readDurationEnv("CHARGING_RETRY_BASE_DELAY", time.Second),
+	authClient := charging.NewHasuraAuthorizationClient(
+		firstNonEmptyEnv("CHARGING_STATUS_GRAPHQL_URL", "HASURA_GRAPHQL_URL"),
+		firstNonEmptyEnv("HASURA_GRAPHQL_ADMIN_SECRET"),
+		firstNonEmptyEnv("HASURA_GRAPHQL_BEARER_TOKEN"),
+		tenantRaw,
+		firstNonEmptyEnv("CITRINE_ID_TOKEN_TYPE"),
+		slog.Default(),
+	)
+	chargingService := charging.NewService(db, client, statusClient, authClient, slog.Default(), charging.ServiceConfig{
+		IDTokenType:            firstNonEmptyEnv("CITRINE_ID_TOKEN_TYPE"),
+		CallbackURL:            callbackURL,
+		UseWebhookEvents:       readBoolEnv("CHARGING_USE_WEBHOOK_EVENTS", false),
+		StartTimeout:           readDurationEnv("CHARGING_START_TIMEOUT", 5*time.Minute),
+		SyncTimeout:            readDurationEnv("CHARGING_STATUS_SYNC_TIMEOUT", 5*time.Minute),
+		SyncInterval:           readDurationEnv("CHARGING_STATUS_SYNC_INTERVAL", 5*time.Second),
+		RetryMaxAttempts:       readIntEnv("CHARGING_RETRY_MAX_ATTEMPTS", 5),
+		RetryBaseDelay:         readDurationEnv("CHARGING_RETRY_BASE_DELAY", time.Second),
+		RemoteStopInitialDelay: readDurationEnv("CHARGING_REMOTE_STOP_INITIAL_DELAY", 2*time.Second),
+		RemoteStopPollInterval: readDurationEnv("CHARGING_REMOTE_STOP_POLL_INTERVAL", 2*time.Second),
+		RemoteStopMaxAttempts:  readIntEnv("CHARGING_REMOTE_STOP_MAX_ATTEMPTS", 20),
 	})
 	chargingHandler := handlers.NewChargingHandler(db, chargingService)
 
@@ -144,6 +156,21 @@ func readDurationEnv(key string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return value
+}
+
+func readBoolEnv(key string, fallback bool) bool {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	switch strings.ToLower(raw) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
+	}
 }
 
 func firstNonEmptyEnv(keys ...string) string {

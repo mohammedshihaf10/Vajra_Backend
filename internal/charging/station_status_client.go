@@ -9,6 +9,7 @@ import (
 	"log"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -137,11 +138,65 @@ const transactionByIDQuery = `query GetTransactionById($id: Int!) {
   }
 }`
 
+const meterValuesByTransactionIDQuery = `query GetMeterValuesByTransactionId($id: Int!) {
+  MeterValues(
+    where: {Transaction: {id: {_eq: $id}}}
+    order_by: [{updatedAt: desc}, {id: desc}]
+    limit: 1
+  ) {
+    id
+    updatedAt
+    sampledValue
+    Transaction {
+      id
+      timeSpentCharging
+      isActive
+      chargingState
+      stationId
+      stoppedReason
+      transactionId
+      evseId
+      remoteStartId
+      totalKwh
+      createdAt
+      updatedAt
+      Connector {
+        connectorId
+      }
+    }
+  }
+}`
+
+const transactionByOCPPTransactionIDQuery = `query GetTransactionByOCPPTransactionId($transactionId: String!) {
+  Transactions(
+    where: {transactionId: {_eq: $transactionId}}
+    order_by: {updatedAt: desc}
+    limit: 2
+  ) {
+    id
+    timeSpentCharging
+    isActive
+    chargingState
+    stationId
+    stoppedReason
+    transactionId
+    evseId
+    remoteStartId
+    totalKwh
+    createdAt
+    updatedAt
+    Connector {
+      connectorId
+    }
+  }
+}`
+
 type StationStatusClient interface {
 	GetConnectorStatus(ctx context.Context, chargerID string, connectorID int) (*models.ConnectorStatus, error)
 	GetTransactionByRemoteStartID(ctx context.Context, remoteStartID int) (*ActiveTransaction, error)
 	FindFallbackTransactions(ctx context.Context, chargerID string, connectorID int, createdAt string) ([]ActiveTransaction, error)
 	GetTransactionByID(ctx context.Context, id int) (*ChargingTransaction, error)
+	GetTransactionByOCPPTransactionID(ctx context.Context, transactionID string) (*ChargingTransaction, error)
 }
 
 type ActiveTransaction struct {
@@ -169,6 +224,7 @@ type ChargingTransaction struct {
 	CreatedAt         string
 	UpdatedAt         string
 	ConnectorID       int
+	Source            string
 }
 
 type HasuraStationStatusClient struct {
@@ -196,6 +252,7 @@ type stationStatusData struct {
 	ChargingStation *chargingStation    `json:"ChargingStations_by_pk"`
 	Transactions    []graphqlTxSummary  `json:"Transactions"`
 	TransactionByPK *graphqlTransaction `json:"Transactions_by_pk"`
+	MeterValues     []graphqlMeterValue `json:"MeterValues"`
 }
 
 type chargingStation struct {
@@ -241,6 +298,19 @@ type graphqlTxSummary struct {
 	Connector     struct {
 		ConnectorID int `json:"connectorId"`
 	} `json:"Connector"`
+}
+
+type graphqlMeterValue struct {
+	ID           int                 `json:"id"`
+	UpdatedAt    string              `json:"updatedAt"`
+	SampledValue []graphqlSampledKV  `json:"sampledValue"`
+	Transaction  *graphqlTransaction `json:"Transaction"`
+}
+
+type graphqlSampledKV struct {
+	Measurand string `json:"measurand"`
+	Unit      string `json:"unit"`
+	Value     string `json:"value"`
 }
 
 type graphqlConnector struct {
@@ -367,6 +437,29 @@ func (c *HasuraStationStatusClient) GetTransactionByID(ctx context.Context, id i
 		return nil, nil
 	}
 
+	var meterParsed graphqlResponse
+	meterBody, err := c.doGraphQL(ctx, graphqlRequest{
+		Query:         meterValuesByTransactionIDQuery,
+		Variables:     map[string]any{"id": id},
+		OperationName: "GetMeterValuesByTransactionId",
+	}, &meterParsed)
+	if err != nil {
+		return nil, err
+	}
+	if len(meterParsed.Data.MeterValues) > 0 && meterParsed.Data.MeterValues[0].Transaction != nil {
+		log.Printf("HASURA METER VALUES BY TX ID id=%d body=%s", id, truncateLogBody(string(meterBody), 8000))
+		tx := meterParsed.Data.MeterValues[0].Transaction
+		result := toChargingTransaction(*tx)
+		if latest := meterParsed.Data.MeterValues[0].UpdatedAt; strings.TrimSpace(latest) != "" {
+			result.UpdatedAt = latest
+		}
+		if meterKwh := extractMeterKwh(meterParsed.Data.MeterValues[0].SampledValue); meterKwh > 0 && result.TotalKwh <= 0 {
+			result.TotalKwh = meterKwh
+		}
+		result.Source = "meter_values"
+		return result, nil
+	}
+
 	var parsed graphqlResponse
 	body, err := c.doGraphQL(ctx, graphqlRequest{
 		Query:         transactionByIDQuery,
@@ -381,7 +474,54 @@ func (c *HasuraStationStatusClient) GetTransactionByID(ctx context.Context, id i
 	}
 
 	log.Printf("HASURA TRANSACTION BY ID id=%d body=%s", id, truncateLogBody(string(body), 8000))
-	tx := parsed.Data.TransactionByPK
+	result := toChargingTransaction(*parsed.Data.TransactionByPK)
+	result.Source = "transactions_by_pk"
+	return result, nil
+}
+
+func (c *HasuraStationStatusClient) GetTransactionByOCPPTransactionID(ctx context.Context, transactionID string) (*ChargingTransaction, error) {
+	transactionID = strings.TrimSpace(transactionID)
+	if c.url == "" || transactionID == "" {
+		return nil, nil
+	}
+
+	var parsed graphqlResponse
+	body, err := c.doGraphQL(ctx, graphqlRequest{
+		Query:         transactionByOCPPTransactionIDQuery,
+		Variables:     map[string]any{"transactionId": transactionID},
+		OperationName: "GetTransactionByOCPPTransactionId",
+	}, &parsed)
+	if err != nil {
+		return nil, err
+	}
+	if len(parsed.Data.Transactions) == 0 {
+		return nil, nil
+	}
+	if len(parsed.Data.Transactions) > 1 {
+		return nil, fmt.Errorf("multiple transactions matched transactionId=%s", transactionID)
+	}
+
+	log.Printf("HASURA TRANSACTION BY OCPP ID transaction_id=%s body=%s", transactionID, truncateLogBody(string(body), 8000))
+	tx := parsed.Data.Transactions[0]
+	return &ChargingTransaction{
+		ID:                tx.ID,
+		TimeSpentCharging: 0,
+		IsActive:          tx.IsActive,
+		ChargingState:     strings.TrimSpace(tx.ChargingState),
+		StationID:         strings.TrimSpace(tx.StationID),
+		StoppedReason:     "",
+		TransactionID:     strings.TrimSpace(tx.TransactionID),
+		EVSEID:            tx.EVSEID,
+		RemoteStartID:     tx.RemoteStartID,
+		TotalKwh:          tx.TotalKwh,
+		CreatedAt:         tx.CreatedAt,
+		UpdatedAt:         tx.UpdatedAt,
+		ConnectorID:       tx.Connector.ConnectorID,
+		Source:            "transactions_by_ocpp_id",
+	}, nil
+}
+
+func toChargingTransaction(tx graphqlTransaction) *ChargingTransaction {
 	return &ChargingTransaction{
 		ID:                tx.ID,
 		TimeSpentCharging: tx.TimeSpentCharging,
@@ -396,7 +536,32 @@ func (c *HasuraStationStatusClient) GetTransactionByID(ctx context.Context, id i
 		CreatedAt:         tx.CreatedAt,
 		UpdatedAt:         tx.UpdatedAt,
 		ConnectorID:       tx.Connector.ConnectorID,
-	}, nil
+	}
+}
+
+func extractMeterKwh(values []graphqlSampledKV) float64 {
+	for _, item := range values {
+		if !strings.EqualFold(strings.TrimSpace(item.Measurand), "Energy.Active.Import.Register") {
+			continue
+		}
+		raw := strings.TrimSpace(item.Value)
+		if raw == "" {
+			return 0
+		}
+		value, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return 0
+		}
+		switch strings.ToUpper(strings.TrimSpace(item.Unit)) {
+		case "WH":
+			return value / 1000
+		case "KWH":
+			return value
+		default:
+			return 0
+		}
+	}
+	return 0
 }
 
 func (c *HasuraStationStatusClient) doGraphQL(ctx context.Context, reqBody graphqlRequest, out any) ([]byte, error) {
